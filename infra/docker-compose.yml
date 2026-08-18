@@ -1,0 +1,59 @@
+services:
+  control-server:
+    build:
+      context: ..
+      dockerfile: infra/server.Dockerfile
+    environment:
+      CONTROL_SERVER_HOST: 0.0.0.0
+      CONTROL_SERVER_PORT: 8787
+      CLIENT_ORIGIN: "${CLIENT_ORIGIN:-http://localhost:5173,http://127.0.0.1:5173,null}"
+      DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-internet}"
+      STUN_URLS: "${STUN_URLS:-stun:stun.cloudflare.com:3478}"
+      SFU_ENABLED: "${SFU_ENABLED:-true}"
+      SFU_VIEWER_THRESHOLD: "${SFU_VIEWER_THRESHOLD:-2}"
+      LIVEKIT_API_KEY: "${LIVEKIT_API_KEY:-devkey}"
+      LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET:-devsecret-change-before-production}"
+      LIVEKIT_WS_URL: "${LIVEKIT_WS_URL:-wss://media.example.com}"
+      LIVEKIT_API_URL: "${LIVEKIT_API_URL:-http://livekit:7880}"
+      TURN_SHARED_SECRET: "${TURN_SHARED_SECRET:-dev-turn-secret-change-before-production}"
+      TURN_URLS: "${TURN_URLS:-stun:turn.example.com:3478,turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349?transport=tcp}"
+    ports:
+      - "${CONTROL_SERVER_PORT:-8787}:8787"
+    depends_on:
+      - livekit
+      - coturn
+    restart: unless-stopped
+
+  livekit:
+    image: livekit/livekit-server:v1.8
+    command: --config /etc/livekit.yaml
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-devsecret-change-before-production}"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:4.6.3
+    command:
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --fingerprint
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SHARED_SECRET:-dev-turn-secret-change-before-production}
+      - --realm=gamecast.local
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --log-file=stdout
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"
+    restart: unless-stopped

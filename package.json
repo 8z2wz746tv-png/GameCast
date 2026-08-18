@@ -1,0 +1,31 @@
+{
+  "name": "gamecast",
+  "version": "0.3.4",
+  "private": true,
+  "description": "Self-hosted Windows game screen sharing",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,desktop -c green,cyan \"npm run dev:server\" \"npm run dev:desktop\"",
+    "dev:server": "npm run dev -w @gamecast/server",
+    "dev:desktop": "npm run build -w @gamecast/server && npm run dev -w @gamecast/desktop",
+    "build": "npm run build -w @gamecast/server && npm run build -w @gamecast/desktop",
+    "package:win": "npm run build -w @gamecast/server && npm run package:win -w @gamecast/desktop",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build -w @gamecast/server && npm run typecheck --workspaces --if-present",
+    "lint": "biome lint apps/desktop/src apps/desktop/electron apps/server/src packages/contracts/src",
+    "smoke:native": "npm run build:electron -w @gamecast/desktop && electron .deploy/native-smoke-app",
+    "smoke:public": "node .deploy/public-smoke.mjs && node .deploy/public-media-smoke.mjs",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2"
+  }
+}

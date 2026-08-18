@@ -1,0 +1,69 @@
+services:
+  control-server:
+    build:
+      context: .
+      dockerfile: infra/server-runtime.Dockerfile
+    container_name: gamecast-control
+    env_file: .env
+    depends_on:
+      - livekit
+      - coturn
+    networks:
+      - default
+      - project1
+    mem_limit: 256m
+    restart: unless-stopped
+
+  livekit:
+    image: livekit/livekit-server:v1.8
+    container_name: gamecast-livekit
+    command: --config /etc/livekit.yaml
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}"
+    volumes:
+      - ./infra/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7881:7881/tcp"
+      - "50000-50100:50000-50100/udp"
+    networks:
+      - default
+      - project1
+    mem_limit: 384m
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:4.6.3
+    container_name: gamecast-coturn
+    command:
+      - --no-cli
+      - --fingerprint
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SHARED_SECRET}
+      - --realm=sunsetshimmer.mindtype.cn
+      - --external-ip=129.28.42.189
+      - --listening-port=3478
+      - --alt-listening-port=443
+      - --tls-listening-port=5349
+      - --cert=/etc/letsencrypt/live/sunsetshimmer.mindtype.cn/fullchain.pem
+      - --pkey=/etc/letsencrypt/live/sunsetshimmer.mindtype.cn/privkey.pem
+      - --min-port=49160
+      - --max-port=49200
+      - --log-file=stdout
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "443:443/udp"
+      - "5349:5349/tcp"
+      - "49160-49200:49160-49200/udp"
+    networks:
+      - default
+    mem_limit: 128m
+    restart: unless-stopped
+
+networks:
+  project1:
+    external: true
+    name: project1_default

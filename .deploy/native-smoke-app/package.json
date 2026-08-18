@@ -1,0 +1,6 @@
+{
+  "name": "gamecast-native-smoke",
+  "private": true,
+  "type": "module",
+  "main": "../native-capture-smoke.mjs"
+}

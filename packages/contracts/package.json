@@ -1,0 +1,11 @@
+{
+  "name": "@gamecast/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts"
+    }
+  }
+}

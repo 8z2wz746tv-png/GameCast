@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src http: https: ws: wss:; media-src 'self' blob:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'self'" />
+    <meta name="theme-color" content="#0c1110" />
+    <title>GameCast</title>
+    <script>
+      try {
+        const savedTheme = localStorage.getItem("gamecast.theme");
+        if (["oasis", "aurora", "amber", "rose"].includes(savedTheme)) {
+          document.documentElement.dataset.theme = savedTheme;
+        }
+      } catch {}
+    </script>
+    <style>
+      html, body { margin: 0; min-height: 100%; background: #0c1110; }
+      #startup-screen {
+        --startup-accent: #61e3a2;
+        position: fixed;
+        z-index: 9999;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: var(--startup-accent);
+        background: #0c1110;
+        opacity: 1;
+        transition: opacity 180ms ease;
+      }
+      :root[data-theme="aurora"] #startup-screen { --startup-accent: #55c7ff; }
+      :root[data-theme="amber"] #startup-screen { --startup-accent: #f4c55c; }
+      :root[data-theme="rose"] #startup-screen { --startup-accent: #ff7997; }
+      #startup-screen.hiding { opacity: 0; pointer-events: none; }
+      .startup-content { display: grid; justify-items: center; gap: 14px; }
+      .startup-rose { width: 104px; height: 104px; overflow: visible; }
+      .startup-name { color: #edf4ef; font: 650 14px/1 "Segoe UI", "Microsoft YaHei", sans-serif; }
+      .startup-status { color: #77867f; font: 11px/1 "Segoe UI", "Microsoft YaHei", sans-serif; }
+      @media (prefers-reduced-motion: reduce) {
+        #startup-screen { transition-duration: .01ms; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="startup-screen" role="status" aria-label="GameCast 正在启动">
+      <div class="startup-content">
+        <svg class="startup-rose" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+          <g id="startup-rose-group">
+            <path id="startup-rose-path" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.12"></path>
+          </g>
+        </svg>
+        <strong class="startup-name">GameCast</strong>
+        <span class="startup-status">正在准备房间</span>
+      </div>
+    </div>
+    <div id="root"></div>
+    <script>
+      (() => {
+        const screen = document.getElementById("startup-screen");
+        const group = document.getElementById("startup-rose-group");
+        const path = document.getElementById("startup-rose-path");
+        if (!screen || !group || !path) return;
+        const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        const namespace = "http://www.w3.org/2000/svg";
+        const particles = Array.from({ length: 38 }, () => {
+          const circle = document.createElementNS(namespace, "circle");
+          circle.setAttribute("fill", "currentColor");
+          group.appendChild(circle);
+          return circle;
+        });
+        const point = (progress, detail) => {
+          const angle = progress * Math.PI * 2;
+          const radius = (9.2 + detail * 0.6) * (0.72 + detail * 0.28) * Math.cos(3 * angle);
+          return {
+            x: 50 + Math.cos(angle) * radius * 3.25,
+            y: 50 + Math.sin(angle) * radius * 3.25,
+          };
+        };
+        const startedAt = performance.now();
+        const render = (now) => {
+          if (!screen.isConnected) return;
+          const elapsed = now - startedAt;
+          const progress = reducedMotion ? 0.32 : (elapsed % 3600) / 3600;
+          const detail = reducedMotion ? 0.75 : 0.76 + Math.sin(elapsed / 720) * 0.24;
+          const commands = [];
+          for (let index = 0; index <= 240; index += 1) {
+            const location = point(index / 240, detail);
+            commands.push(`${index === 0 ? "M" : "L"} ${location.x.toFixed(2)} ${location.y.toFixed(2)}`);
+          }
+          path.setAttribute("d", commands.join(" "));
+          group.setAttribute("transform", `rotate(${reducedMotion ? 0 : -(elapsed / 90) % 360} 50 50)`);
+          particles.forEach((particle, index) => {
+            const offset = index / (particles.length - 1);
+            const normalized = ((progress - offset * 0.31) % 1 + 1) % 1;
+            const location = point(normalized, detail);
+            const fade = Math.pow(1 - offset, 0.56);
+            particle.setAttribute("cx", location.x.toFixed(2));
+            particle.setAttribute("cy", location.y.toFixed(2));
+            particle.setAttribute("r", (0.55 + fade * 1.8).toFixed(2));
+            particle.setAttribute("opacity", (0.04 + fade * 0.96).toFixed(3));
+          });
+          if (!reducedMotion) requestAnimationFrame(render);
+        };
+        requestAnimationFrame(render);
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
