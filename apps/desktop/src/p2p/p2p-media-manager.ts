@@ -6,21 +6,12 @@ import type {
   ShareDescriptor,
   VideoPreset,
 } from "@gamecast/contracts";
-import type { SignalingClient } from "./signaling-client";
-import {
-  getEffectiveQualityPolicy,
-  isCaptureTargetMet,
-  isIceCandidateAllowed,
-} from "./quality-policy";
-import type { SfuFallback } from "./sfu-fallback";
 import {
   diagnosticLog,
   errorDetails,
   summarizeIceCandidate,
   summarizeSdp,
 } from "../diagnostics";
-import { InboundMediaStallDetector } from "./inbound-stall-detector";
-import { IceCandidateBuffer } from "./ice-candidate-buffer";
 import {
   getConnectionRecoveryAction,
   getPendingConnectionFailureAction,
@@ -31,6 +22,15 @@ import {
   isSystemAudioCaptureFailure,
   shouldUseNativeScreenCapture,
 } from "./display-capture-error";
+import { IceCandidateBuffer } from "./ice-candidate-buffer";
+import { InboundMediaStallDetector } from "./inbound-stall-detector";
+import {
+  getEffectiveQualityPolicy,
+  isCaptureTargetMet,
+  isIceCandidateAllowed,
+} from "./quality-policy";
+import type { SfuFallback } from "./sfu-fallback";
+import type { SignalingClient } from "./signaling-client";
 
 export type MediaStats = {
   transport: MediaTransport;
@@ -40,6 +40,13 @@ export type MediaStats = {
   bitrateKbps?: number;
   roundTripTimeMs?: number;
   encoder?: string;
+};
+
+export type MediaConnectionStage = {
+  phase: "idle" | "direct" | "turn" | "sfu" | "recovering" | "connected" | "failed";
+  message: string;
+  expiresAt?: number;
+  attempt?: number;
 };
 
 export type P2PMediaCallbacks = {
@@ -61,6 +68,7 @@ export type P2PMediaCallbacks = {
   onError: (message: string) => void;
   onStats: (stats: MediaStats | undefined) => void;
   onPublisherStats: (stats: MediaStats | undefined) => void;
+  onConnectionStage: (stage: MediaConnectionStage) => void;
 };
 
 type OutgoingConnection = {
@@ -88,6 +96,7 @@ type IncomingConnection = {
   stallDetector: InboundMediaStallDetector;
   attempt: number;
   requestReason: "selection" | "media-stalled";
+  keyFrameRequestedAt?: number;
   fallbackRequested?: boolean;
 };
 
@@ -105,7 +114,6 @@ export class P2PMediaManager {
   private nativePolicySignature: string | undefined;
   private nativePolicyTimer: ReturnType<typeof setTimeout> | undefined;
   private nativeAudioPeer: RTCPeerConnection | undefined;
-  private localPreviewActive = false;
   private auxiliaryCaptureReduced = false;
   private shareStartPromise: Promise<void> | undefined;
   private captureEndedTrack: MediaStreamTrack | undefined;
@@ -227,14 +235,20 @@ export class P2PMediaManager {
     this.requestedPreset = preset;
     let stream: MediaStream;
     let audioCaptureError: unknown;
-    const videoConstraints: MediaTrackConstraints = {
-      width: { ideal: preset.width, max: preset.width },
-      height: { ideal: preset.height, max: preset.height },
-      frameRate: {
-        ideal: preset.frameRate,
-        max: preset.frameRate,
-      },
-    };
+    const videoConstraints: MediaTrackConstraints = useNativeScreenCapture
+      ? {
+          width: { ideal: 320, max: 320 },
+          height: { ideal: 180, max: 180 },
+          frameRate: { ideal: 5, max: 5 },
+        }
+      : {
+          width: { ideal: preset.width, max: preset.width },
+          height: { ideal: preset.height, max: preset.height },
+          frameRate: {
+            ideal: preset.frameRate,
+            max: preset.frameRate,
+          },
+        };
     try {
       stream = await navigator.mediaDevices.getDisplayMedia({
         video: videoConstraints,
@@ -284,7 +298,18 @@ export class P2PMediaManager {
     try {
       // Chromium is only an auxiliary audio/preview source for native whole-screen
       // sharing. The native capture result below is the authoritative quality check.
-      await this.applyCapturePolicy(!useNativeScreenCapture);
+      if (useNativeScreenCapture) {
+        await this.applyReducedAuxiliaryCapture(videoTrack).catch((error) => {
+          diagnosticLog(
+            "media",
+            "auxiliary-capture.initial-reduction-failed",
+            errorDetails(error),
+            "warn",
+          );
+        });
+      } else {
+        await this.applyCapturePolicy(true);
+      }
     } catch (error) {
       this.localStream = undefined;
       this.detachCaptureEndedHandler();
@@ -315,6 +340,8 @@ export class P2PMediaManager {
         }
         diagnosticLog("native-media", "start.completed", {
           encoder: native.encoder,
+          captureBackend: native.captureBackend,
+          pipeline: native.pipeline,
           width: native.width,
           height: native.height,
           frameRate: native.frameRate,
@@ -339,6 +366,7 @@ export class P2PMediaManager {
         }
         this.nativeMode = true;
         this.nativePolicySignature = `${native.width}x${native.height}:${native.bitrateKbps}`;
+        const nativeEncoderLabel = formatNativeEncoderLabel(native);
         // Keep the capture session alive for loopback audio and SFU fallback. This
         // video track is not attached to native P2P peers, so Chromium does not encode it.
         this.callbacks.onLocalShareChanged(
@@ -346,7 +374,7 @@ export class P2PMediaManager {
           nativeSystemAudio,
           true,
           "native",
-          native.encoder,
+          nativeEncoderLabel,
         );
         this.callbacks.onPublisherStats({
           transport: "p2p",
@@ -354,7 +382,7 @@ export class P2PMediaManager {
           height: native.height,
           framesPerSecond: native.frameRate,
           bitrateKbps: native.bitrateKbps,
-          encoder: native.encoder,
+          encoder: nativeEncoderLabel,
         });
         await this.updateAuxiliaryCaptureQuality();
         this.signaling.send({
@@ -429,7 +457,7 @@ export class P2PMediaManager {
           result.hasSystemAudio,
           true,
           "native",
-          result.encoder,
+          formatNativeEncoderLabel(result),
         );
         await this.updateAuxiliaryCaptureQuality();
         this.signaling.send({
@@ -481,7 +509,6 @@ export class P2PMediaManager {
     this.nativeAudioPeer = undefined;
     this.nativeMode = false;
     this.nativePolicySignature = undefined;
-    this.localPreviewActive = false;
     this.auxiliaryCaptureReduced = false;
     if (this.nativePolicyTimer) clearTimeout(this.nativePolicyTimer);
     this.nativePolicyTimer = undefined;
@@ -523,7 +550,6 @@ export class P2PMediaManager {
     }
     this.desiredTargetId = share.participantId;
     if (share.participantId === this.selfParticipantId) {
-      this.localPreviewActive = true;
       void this.updateAuxiliaryCaptureQuality();
       this.releaseRemoteWatches();
       if (this.localStream) {
@@ -534,7 +560,6 @@ export class P2PMediaManager {
       }
       return;
     }
-    this.localPreviewActive = false;
     void this.updateAuxiliaryCaptureQuality();
 
     this.requestIncomingConnection(share.participantId, "selection");
@@ -549,6 +574,24 @@ export class P2PMediaManager {
     if (this.pendingConnectionId) this.releaseConnection(this.pendingConnectionId);
     const connectionId = crypto.randomUUID();
     this.pendingConnectionId = connectionId;
+    const hasTurn = this.hasTurnServer();
+    const phase = reason === "media-stalled"
+      ? "recovering"
+      : attempt > 1 && hasTurn
+        ? "turn"
+        : "direct";
+    this.callbacks.onConnectionStage({
+      phase,
+      message: reason === "media-stalled"
+        ? "画面停滞，正在自动恢复"
+        : phase === "turn"
+          ? "直连未成功，正在尝试 TURN 中转"
+          : hasTurn
+            ? "正在尝试 P2P 直连，并准备 TURN 备用链路"
+            : "正在尝试 P2P 直连",
+      expiresAt: Date.now() + this.p2pSession.connectionTimeoutSeconds * 1000,
+      attempt,
+    });
     diagnosticLog("viewer", "watch.requested", {
       connectionId,
       targetParticipantId,
@@ -574,12 +617,16 @@ export class P2PMediaManager {
     this.incoming.set(connectionId, {
       connectionId,
       targetParticipantId,
-      pc: this.createPeerConnection(connectionId, targetParticipantId),
+      pc: this.createPeerConnection(
+        connectionId,
+        targetParticipantId,
+        attempt > 1 && hasTurn,
+      ),
       stream: new MediaStream(),
       ready: false,
       transport: "p2p",
       timeout,
-      stallDetector: new InboundMediaStallDetector(),
+      stallDetector: new InboundMediaStallDetector(4_000),
       attempt,
       requestReason: reason,
     });
@@ -634,6 +681,7 @@ export class P2PMediaManager {
     if (this.desiredTargetId === participantId) {
       this.cancelConnectionRetry();
       this.desiredTargetId = undefined;
+      this.callbacks.onConnectionStage({ phase: "idle", message: "未选择共享画面" });
       this.callbacks.onError("当前共享已经结束");
     }
   }
@@ -680,6 +728,7 @@ export class P2PMediaManager {
         this.closeIncoming(message.connectionId);
         if (this.pendingConnectionId === message.connectionId) this.pendingConnectionId = undefined;
         this.callbacks.onError(message.reason);
+        this.callbacks.onConnectionStage({ phase: "failed", message: message.reason });
         return;
       case "sfu.publish-requested":
         await this.publishSfuFallback(message.connectionId, message.viewer.id);
@@ -697,6 +746,9 @@ export class P2PMediaManager {
           this.releaseConnection(message.connectionId);
         }
         this.callbacks.onError(message.message);
+        if (message.connectionId) {
+          this.callbacks.onConnectionStage({ phase: "failed", message: message.message });
+        }
         return;
       default:
         return;
@@ -711,6 +763,11 @@ export class P2PMediaManager {
     this.pendingCandidates.clear();
     await this.stopSharing(false);
     await this.sfu.disconnect();
+  }
+
+  retrySelectedShare(): void {
+    if (!this.desiredTargetId) return;
+    this.requestIncomingConnection(this.desiredTargetId, "selection");
   }
 
   private async createNativeAudioOffer(stream: MediaStream): Promise<string | undefined> {
@@ -825,7 +882,7 @@ export class P2PMediaManager {
         stream: new MediaStream(),
         ready: false,
         transport: "p2p",
-        stallDetector: new InboundMediaStallDetector(),
+        stallDetector: new InboundMediaStallDetector(4_000),
         attempt: 1,
         requestReason: "selection",
       };
@@ -968,6 +1025,10 @@ export class P2PMediaManager {
       record.stream,
       record.transport,
     );
+    this.callbacks.onConnectionStage({
+      phase: "connected",
+      message: record.transport === "turn" ? "已通过 TURN 中转连接" : "P2P 直连成功",
+    });
     this.signaling.send({
       type: "watch.commit",
       connectionId: record.connectionId,
@@ -1032,12 +1093,14 @@ export class P2PMediaManager {
     targetParticipantId: string,
   ): Promise<void> {
     if (this.pendingConnectionId !== connectionId) return;
+    this.callbacks.onConnectionStage({ phase: "sfu", message: "正在连接 SFU 备用线路" });
     try {
       const stream = await this.sfu.subscribe(targetParticipantId);
       this.closeIncoming(connectionId, true);
       this.displayedConnectionId = connectionId;
       this.callbacks.onStream(connectionId, targetParticipantId, stream, "sfu");
       this.callbacks.onStats({ transport: "sfu" });
+      this.callbacks.onConnectionStage({ phase: "connected", message: "已通过 SFU 连接" });
       this.signaling.send({ type: "watch.commit", connectionId, transport: "sfu" });
     } catch (error) {
       this.callbacks.onError(error instanceof Error ? error.message : "SFU 回退失败");
@@ -1045,9 +1108,16 @@ export class P2PMediaManager {
     }
   }
 
-  private createPeerConnection(connectionId: string, targetParticipantId: string): RTCPeerConnection {
-    const pc = new RTCPeerConnection({ iceServers: this.p2pSession.iceServers });
-    diagnosticLog("webrtc", "peer.created", { connectionId, targetParticipantId });
+  private createPeerConnection(
+    connectionId: string,
+    targetParticipantId: string,
+    forceRelay = false,
+  ): RTCPeerConnection {
+    const pc = new RTCPeerConnection({
+      iceServers: this.p2pSession.iceServers,
+      iceTransportPolicy: forceRelay ? "relay" : "all",
+    });
+    diagnosticLog("webrtc", "peer.created", { connectionId, targetParticipantId, forceRelay });
     pc.onicecandidate = (event) => {
       if (event.candidate && !isIceCandidateAllowed(event.candidate, this.allowedHostAddresses)) {
         diagnosticLog("webrtc", "ice.local.filtered", {
@@ -1226,7 +1296,7 @@ export class P2PMediaManager {
     if (!this.nativeMode) return;
     const videoTrack = this.localStream?.getVideoTracks()[0];
     if (videoTrack?.readyState !== "live") return;
-    const needsFullQuality = forceFullQuality || this.localPreviewActive || this.sfuConnections.size > 0;
+    const needsFullQuality = forceFullQuality || this.sfuConnections.size > 0;
     if (needsFullQuality && !this.auxiliaryCaptureReduced) return;
     if (!needsFullQuality && this.auxiliaryCaptureReduced) return;
     try {
@@ -1234,12 +1304,7 @@ export class P2PMediaManager {
         await this.applyCapturePolicy(false);
         this.auxiliaryCaptureReduced = false;
       } else {
-        await videoTrack.applyConstraints({
-          width: { ideal: 640, max: 640 },
-          height: { ideal: 360, max: 360 },
-          frameRate: { ideal: 8, max: 10 },
-        });
-        this.auxiliaryCaptureReduced = true;
+        await this.applyReducedAuxiliaryCapture(videoTrack);
       }
       diagnosticLog("media", "auxiliary-capture.updated", {
         fullQuality: needsFullQuality,
@@ -1248,6 +1313,15 @@ export class P2PMediaManager {
     } catch (error) {
       diagnosticLog("media", "auxiliary-capture.update-failed", errorDetails(error), "warn");
     }
+  }
+
+  private async applyReducedAuxiliaryCapture(videoTrack: MediaStreamTrack): Promise<void> {
+    await videoTrack.applyConstraints({
+      width: { ideal: 320, max: 320 },
+      height: { ideal: 180, max: 180 },
+      frameRate: { ideal: 5, max: 5 },
+    });
+    this.auxiliaryCaptureReduced = true;
   }
 
   private async applySenderBitrate(record: OutgoingConnection): Promise<void> {
@@ -1441,6 +1515,17 @@ export class P2PMediaManager {
       }
     });
     this.callbacks.onStats(result);
+    if (!mediaStalled && active.keyFrameRequestedAt) {
+      active.keyFrameRequestedAt = undefined;
+      this.callbacks.onConnectionStage({
+        phase: "connected",
+        message: active.transport === "turn" ? "中转画面已恢复" : "直连画面已恢复",
+      });
+      diagnosticLog("viewer", "media-recovered", {
+        connectionId: active.connectionId,
+        targetParticipantId: active.targetParticipantId,
+      });
+    }
     if (
       mediaStalled &&
       active.ready &&
@@ -1450,14 +1535,36 @@ export class P2PMediaManager {
       this.desiredTargetId === active.targetParticipantId &&
       sampledAt >= this.stallRecoveryCooldownUntil
     ) {
-      this.stallRecoveryCooldownUntil = sampledAt + 20_000;
-      diagnosticLog("viewer", "media-stalled", {
-        connectionId: active.connectionId,
-        targetParticipantId: active.targetParticipantId,
-        stalledForMs,
-        action: "replace-connection",
-      }, "warn");
-      this.requestIncomingConnection(active.targetParticipantId, "media-stalled");
+      if (!active.keyFrameRequestedAt) {
+        active.keyFrameRequestedAt = sampledAt;
+        this.callbacks.onConnectionStage({
+          phase: "recovering",
+          message: "检测到画面停滞，正在请求关键帧",
+          expiresAt: sampledAt + 4_000,
+        });
+        diagnosticLog("viewer", "media-stalled", {
+          connectionId: active.connectionId,
+          targetParticipantId: active.targetParticipantId,
+          stalledForMs,
+          action: "request-keyframe",
+        }, "warn");
+        for (const receiver of active.pc.getReceivers()) {
+          if (receiver.track?.kind !== "video") continue;
+          const requestKeyFrame = (receiver as RTCRtpReceiver & {
+            requestKeyFrame?: () => Promise<void> | void;
+          }).requestKeyFrame;
+          if (requestKeyFrame) void Promise.resolve(requestKeyFrame.call(receiver)).catch(() => undefined);
+        }
+      } else if (sampledAt - active.keyFrameRequestedAt >= 4_000) {
+        this.stallRecoveryCooldownUntil = sampledAt + 20_000;
+        diagnosticLog("viewer", "media-stalled", {
+          connectionId: active.connectionId,
+          targetParticipantId: active.targetParticipantId,
+          stalledForMs,
+          action: "replace-connection",
+        }, "warn");
+        this.requestIncomingConnection(active.targetParticipantId, "media-stalled");
+      }
     }
     if (Date.now() - this.lastIncomingDiagnosticAt >= 5_000) {
       this.lastIncomingDiagnosticAt = Date.now();
@@ -1547,6 +1654,13 @@ export class P2PMediaManager {
     });
     if (action === "none") return;
     if (action === "retry-p2p") {
+      this.callbacks.onConnectionStage({
+        phase: this.hasTurnServer() ? "turn" : "direct",
+        message: this.hasTurnServer()
+          ? "直连超时，正在切换 TURN 中转"
+          : "首次连接超时，正在重新尝试直连",
+        attempt: record.attempt + 1,
+      });
       diagnosticLog("viewer", "watch.retry-scheduled", {
         connectionId: record.connectionId,
         targetParticipantId: record.targetParticipantId,
@@ -1570,6 +1684,12 @@ export class P2PMediaManager {
     }
 
     record.fallbackRequested = true;
+    this.callbacks.onConnectionStage({
+      phase: this.sfu.available ? "sfu" : "failed",
+      message: this.sfu.available
+        ? "P2P 与 TURN 均未成功，正在回退 SFU"
+        : "直连和中转均不可用",
+    });
     diagnosticLog("viewer", "watch.fallback-requested", {
       connectionId: record.connectionId,
       targetParticipantId: record.targetParticipantId,
@@ -1591,6 +1711,12 @@ export class P2PMediaManager {
   private cancelConnectionRetry(): void {
     if (this.connectionRetryTimer) clearTimeout(this.connectionRetryTimer);
     this.connectionRetryTimer = undefined;
+  }
+
+  private hasTurnServer(): boolean {
+    return this.p2pSession.iceServers.some((server) =>
+      server.urls.some((url) => /^turns?:/i.test(url)),
+    );
   }
 
   private releaseConnection(connectionId: string): void {
@@ -1641,6 +1767,18 @@ export class P2PMediaManager {
       this.pendingConnectionId = undefined;
     }
   }
+}
+
+function formatNativeEncoderLabel(result: {
+  encoder: string;
+  captureBackend: "gfxcapture" | "ddagrab";
+  pipeline: "gpu" | "compatibility";
+}): string {
+  if (result.captureBackend === "gfxcapture" && result.pipeline === "gpu") {
+    return `${result.encoder} · WGC 零拷贝`;
+  }
+  if (result.pipeline === "gpu") return `${result.encoder} · GPU 缩放`;
+  return `${result.encoder} · 兼容路径`;
 }
 
 function waitForIceGathering(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {

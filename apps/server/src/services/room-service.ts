@@ -21,8 +21,8 @@ import type {
   ShareState,
   WatchRelation,
 } from "../domain/room.js";
-import { hashPassword, verifyPassword } from "./password-service.js";
 import { selectInitialMediaRoute } from "./media-routing-policy.js";
+import { hashPassword, verifyPassword } from "./password-service.js";
 
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const DEFAULT_SESSION_TTL_SECONDS = 6 * 60 * 60;

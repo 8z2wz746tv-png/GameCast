@@ -1,6 +1,15 @@
 export type ParticipantRole = "host" | "member";
 export type MediaMode = "hybrid";
 export type MediaTransport = "p2p" | "turn" | "sfu";
+export type NetworkMode = "direct" | "easytier";
+
+/** Public room networking details. Secrets are intentionally not part of a session. */
+export type RoomNetworkInfo = {
+  mode: NetworkMode;
+  virtualIp?: string;
+  networkName?: string;
+  peerAddresses?: string[];
+};
 
 export type ParticipantSummary = {
   id: string;
@@ -53,6 +62,12 @@ export type ControlServerHealth = {
   sfuViewerThreshold: number;
 };
 
+export type NetworkPreflightSession = {
+  p2p: P2PSession;
+  sfuAvailable: boolean;
+  issuedAt: string;
+};
+
 export type SfuSession = {
   serverUrl: string;
   token: string;
@@ -65,6 +80,7 @@ export type RoomSession = {
   signaling: SignalingSession;
   p2p: P2PSession;
   sfu?: SfuSession;
+  network?: RoomNetworkInfo;
 };
 
 export type CreateRoomRequest = {

@@ -1,6 +1,6 @@
 {
   "name": "@gamecast/desktop",
-  "version": "0.3.4",
+  "version": "0.3.7",
   "private": true,
   "type": "module",
   "description": "GameCast Windows desktop client",
@@ -12,7 +12,7 @@
     "clean:electron": "node -e \"require('node:fs').rmSync('dist-electron',{recursive:true,force:true})\"",
     "build:electron": "npm run clean:electron && tsc -p tsconfig.electron.json && esbuild electron/native-media.ts --bundle --platform=node --format=esm --target=node22 --external:electron --external:ffmpeg-static --sourcemap --banner:js=\"import { createRequire as __gamecastCreateRequire } from 'node:module'; const require = __gamecastCreateRequire(import.meta.url);\" --outfile=dist-electron/native-media.js",
     "package:win": "npm run build && electron-builder --win --x64",
-    "test": "tsx --test src/p2p/quality-policy.test.ts src/p2p/display-capture-error.test.ts src/p2p/inbound-stall-detector.test.ts src/p2p/ice-candidate-buffer.test.ts src/p2p/connection-recovery-policy.test.ts src/p2p/signaling-client.test.ts src/room-invitation.test.ts src/server-address.test.ts electron/async-line-writer.test.ts electron/diagnostics.test.ts electron/ipc-validation.test.ts electron/native-output.test.ts electron/native-rtp-fanout.test.ts electron/native-rtp-webrtc.test.ts electron/rtp-continuity.test.ts electron/serial-task-queue.test.ts",
+    "test": "tsx --test src/network-preflight.test.ts src/p2p/quality-policy.test.ts src/p2p/display-capture-error.test.ts src/p2p/inbound-stall-detector.test.ts src/p2p/ice-candidate-buffer.test.ts src/p2p/connection-recovery-policy.test.ts src/p2p/signaling-client.test.ts src/room-invitation.test.ts src/server-address.test.ts electron/async-line-writer.test.ts electron/diagnostics.test.ts electron/ipc-validation.test.ts electron/network-adapter.test.ts electron/native-output.test.ts electron/native-rtp-fanout.test.ts electron/native-rtp-webrtc.test.ts electron/native-video-pipeline.test.ts electron/rtp-continuity.test.ts electron/serial-task-queue.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit"
   },
   "dependencies": {
@@ -22,26 +22,36 @@
     "zod": "^4.1.5"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^5.0.2",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.2",
     "cross-env": "^10.0.0",
     "electron": "43.3.0",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "livekit-client": "^2.15.6",
+    "lucide": "^1.28.0",
     "lucide-react": "^0.468.0",
+    "morphicons": "^1.7.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "tsx": "^4.20.5",
-    "vite": "^7.1.3",
-    "werift": "^0.24.3",
     "typescript": "^5.9.2",
-    "wait-on": "^8.0.4"
+    "vite": "^7.1.3",
+    "wait-on": "^8.0.4",
+    "werift": "^0.24.3"
   },
   "build": {
     "appId": "dev.gamecast.desktop",
     "productName": "GameCast",
+    "protocols": [
+      {
+        "name": "GameCast 房间邀请",
+        "schemes": [
+          "gamecast"
+        ]
+      }
+    ],
     "asar": true,
     "directories": {
       "output": "release-friends"
@@ -65,16 +75,31 @@
     ],
     "extraResources": [
       {
-        "from": "../../node_modules/ffmpeg-static",
+        "from": "native",
         "to": "native",
         "filter": [
+          "README.txt",
+          "EASYTIER-VERSION.txt",
+          "FFMPEG-VERSION.txt",
           "ffmpeg.exe",
           "ffmpeg.exe.LICENSE",
-          "ffmpeg.exe.README"
+          "avcodec-63.dll",
+          "avdevice-63.dll",
+          "avfilter-12.dll",
+          "avformat-63.dll",
+          "avutil-61.dll",
+          "swresample-7.dll",
+          "swscale-10.dll",
+          "easytier-core.exe",
+          "easytier-core.exe.*",
+          "wintun.dll",
+          "Packet.dll",
+          "WinDivert64.sys"
         ]
       }
     ],
     "win": {
+      "signAndEditExecutable": true,
       "target": [
         {
           "target": "nsis",

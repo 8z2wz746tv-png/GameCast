@@ -5,8 +5,7 @@ import type {
 import WebSocket from "ws";
 import { DomainError } from "../domain/errors.js";
 import type { Room, WatchRelation } from "../domain/room.js";
-import type { RoomAccess } from "./room-service.js";
-import type { ParticipantRemoval, RoomService } from "./room-service.js";
+import type { ParticipantRemoval, RoomAccess, RoomService } from "./room-service.js";
 import { parseSignalMessage } from "./signal-protocol.js";
 
 const MAX_MESSAGES_PER_WINDOW = 200;

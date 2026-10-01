@@ -1,16 +1,17 @@
+import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import cors from "@fastify/cors";
-import Fastify, { type FastifyInstance } from "fastify";
-import { ZodError } from "zod";
-import { WebSocketServer } from "ws";
 import type { ApiError } from "@gamecast/contracts";
+import Fastify, { type FastifyInstance } from "fastify";
+import { WebSocketServer } from "ws";
+import { ZodError } from "zod";
 import type { ControlServerRuntimeConfig } from "./config.js";
 import { DomainError } from "./domain/errors.js";
 import { registerRoomRoutes } from "./routes/rooms.js";
 import { MediaSessionService } from "./services/media-token-service.js";
+import { RequestRateLimiter } from "./services/request-rate-limiter.js";
 import { RoomService } from "./services/room-service.js";
 import { SignalHub } from "./services/signal-hub.js";
-import { RequestRateLimiter } from "./services/request-rate-limiter.js";
 
 export type ControlServerHandle = {
   app: FastifyInstance;
@@ -93,6 +94,18 @@ export async function createControlServer(
     sfuAvailable: await mediaSessions.isSfuAvailable(),
     sfuViewerThreshold,
   }));
+  app.get("/api/network/preflight", async () => ({
+    p2p: mediaSessions.createP2PSession(`preflight-${randomUUID()}`),
+    sfuAvailable: await mediaSessions.isSfuAvailable(),
+    issuedAt: new Date().toISOString(),
+  }));
+  app.post("/api/network/upload-probe", async (request) => {
+    const body = request.body as { payload?: unknown } | undefined;
+    if (typeof body?.payload !== "string" || body.payload.length > 768 * 1024) {
+      throw new DomainError("INVALID_REQUEST", "上传检测数据无效", 400);
+    }
+    return { receivedBytes: Buffer.byteLength(body.payload, "utf8") };
+  });
   await registerRoomRoutes(
     app,
     rooms,

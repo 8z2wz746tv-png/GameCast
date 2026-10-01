@@ -1,7 +1,14 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createSocket, type Socket } from "node:dgram";
 import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { constants as osConstants, setPriority } from "node:os";
+import { dirname, join } from "node:path";
+import type {
+  IceCandidateData,
+  IceServerConfig,
+  SessionDescriptionData,
+  VideoPreset,
+} from "@gamecast/contracts";
 import { app } from "electron";
 import ffmpegStatic from "ffmpeg-static";
 import {
@@ -13,21 +20,26 @@ import {
   useH264,
   useOPUS,
 } from "werift";
-import type {
-  IceCandidateData,
-  IceServerConfig,
-  SessionDescriptionData,
-  VideoPreset,
-} from "@gamecast/contracts";
 import {
-  matchNativeOutputPreviews,
-  resolveNativeOutputIndex,
   type ElectronScreenPreview,
+  matchNativeOutputPreviews,
   type NativeOutputCalibration,
+  resolveNativeOutputIndex,
 } from "./native-output.js";
-import { NativeRtpFanout, isNativeRtpStalled } from "./native-rtp-fanout.js";
+import { isNativeRtpStalled, NativeRtpFanout } from "./native-rtp-fanout.js";
+import {
+  buildEncoderAttempts,
+  buildFfmpegArgs,
+  detectNativeMediaCapabilities,
+  type EncoderDefinition,
+  type NativeCaptureBackend,
+  type NativeMediaCapabilities,
+  type NativeMediaPipeline,
+} from "./native-video-pipeline.js";
 import { RtpContinuityRewriter } from "./rtp-continuity.js";
 import { SerialTaskQueue } from "./serial-task-queue.js";
+
+export type { NativeCaptureBackend, NativeMediaPipeline } from "./native-video-pipeline.js";
 
 export type NativeMediaStartRequest = {
   sourceId: string;
@@ -41,6 +53,8 @@ export type NativeMediaStartRequest = {
 
 export type NativeMediaStartResult = {
   encoder: string;
+  captureBackend: NativeCaptureBackend;
+  pipeline: NativeMediaPipeline;
   width: number;
   height: number;
   frameRate: number;
@@ -48,6 +62,20 @@ export type NativeMediaStartResult = {
   hasSystemAudio: boolean;
   audioAnswer?: string;
   audioError?: string;
+};
+
+export type NativeMediaPreflightResult = {
+  sourceKind: "screen" | "window";
+  nativeAvailable: boolean;
+  outputMapped: boolean;
+  captureBackend?: NativeCaptureBackend;
+  encoders: string[];
+  recommendedEncoder?: string;
+  targetWidth: number;
+  targetHeight: number;
+  targetFrameRate: number;
+  requiredUploadKbps: number;
+  issues: string[];
 };
 
 export type NativeMediaEvent =
@@ -96,11 +124,6 @@ type NativePeer = {
   noRtpTimer?: ReturnType<typeof setTimeout>;
 };
 
-type EncoderDefinition = {
-  name: "h264_nvenc" | "h264_qsv" | "h264_amf" | "h264_mf";
-  label: string;
-};
-
 const H264_PAYLOAD_TYPE = 102;
 const OPUS_PAYLOAD_TYPE = 111;
 const RTP_STALL_THRESHOLD_MS = 4_000;
@@ -123,6 +146,9 @@ export class NativeMediaService {
   });
   private config: NativeMediaStartRequest | undefined;
   private encoder: EncoderDefinition | undefined;
+  private captureBackend: NativeCaptureBackend = "ddagrab";
+  private pipeline: NativeMediaPipeline = "compatibility";
+  private capabilitiesPromise: Promise<NativeMediaCapabilities> | undefined;
   private ffmpeg: ChildProcessWithoutNullStreams | undefined;
   private rtpSocket: Socket | undefined;
   private audioBridge: RTCPeerConnection | undefined;
@@ -136,10 +162,78 @@ export class NativeMediaService {
   private lastRtpAt = 0;
   private lastRtpDiagnosticAt = 0;
   private mediaWatchdog: ReturnType<typeof setInterval> | undefined;
+  private encoderIdleTimer: ReturnType<typeof setTimeout> | undefined;
   private recoveryScheduled = false;
   private recoveryCount = 0;
 
   constructor(private readonly emit: (event: NativeMediaEvent) => void) {}
+
+  async preflight(
+    sourceId: string,
+    outputIndex: number | undefined,
+    preset: VideoPreset,
+    requiredUploadKbps: number,
+  ): Promise<NativeMediaPreflightResult> {
+    const sourceKind = sourceId.startsWith("screen:") ? "screen" : "window";
+    const issues: string[] = [];
+    if (sourceKind === "window") {
+      issues.push("窗口共享使用兼容捕获，实际帧率取决于窗口渲染频率");
+    } else if (outputIndex === undefined) {
+      issues.push("无法可靠映射所选显示器，将使用兼容捕获");
+    }
+    const ffmpegPath = resolveFfmpegPath();
+    if (!ffmpegPath) {
+      return {
+        sourceKind,
+        nativeAvailable: false,
+        outputMapped: outputIndex !== undefined,
+        encoders: [],
+        targetWidth: preset.width,
+        targetHeight: preset.height,
+        targetFrameRate: preset.frameRate,
+        requiredUploadKbps,
+        issues: [...issues, "没有找到原生媒体运行库，将使用兼容捕获"],
+      };
+    }
+    try {
+      const capabilities = await this.getCapabilities(ffmpegPath);
+      const attempts = buildEncoderAttempts(capabilities);
+      if (attempts.length === 0) issues.push("未检测到 H.264 硬件编码器，将使用兼容捕获");
+      return {
+        sourceKind,
+        nativeAvailable: sourceKind === "screen" && outputIndex !== undefined && attempts.length > 0,
+        outputMapped: outputIndex !== undefined,
+        captureBackend: capabilities.captureBackend,
+        encoders: capabilities.encoders.map((encoder) => encoder.label),
+        recommendedEncoder: attempts[0]?.encoder.label,
+        targetWidth: preset.width,
+        targetHeight: preset.height,
+        targetFrameRate: preset.frameRate,
+        requiredUploadKbps,
+        issues,
+      };
+    } catch (error) {
+      return {
+        sourceKind,
+        nativeAvailable: false,
+        outputMapped: outputIndex !== undefined,
+        encoders: [],
+        targetWidth: preset.width,
+        targetHeight: preset.height,
+        targetFrameRate: preset.frameRate,
+        requiredUploadKbps,
+        issues: [...issues, error instanceof Error ? error.message : "原生媒体能力检测失败"],
+      };
+    }
+  }
+
+  private getCapabilities(ffmpegPath: string): Promise<NativeMediaCapabilities> {
+    this.capabilitiesPromise ??= probeNativeMediaCapabilities(ffmpegPath).catch((error) => {
+      this.capabilitiesPromise = undefined;
+      throw error;
+    });
+    return this.capabilitiesPromise;
+  }
 
   async calibrateOutputIndexes(
     screens: ElectronScreenPreview[],
@@ -173,8 +267,18 @@ export class NativeMediaService {
         matches: [],
       };
     }
+    let captureBackend: NativeCaptureBackend = "ddagrab";
+    try {
+      captureBackend = (await this.getCapabilities(ffmpegPath)).captureBackend;
+    } catch {
+      // Source enumeration must remain usable even when the optional native
+      // probe is unavailable; the actual share startup reports the detailed
+      // encoder/capture error.
+    }
     const probes = await Promise.allSettled(
-      screens.map((_, outputIndex) => captureNativeOutputPreview(ffmpegPath, outputIndex)),
+      screens.map((_, outputIndex) =>
+        captureNativeOutputPreview(ffmpegPath, outputIndex, captureBackend)
+      ),
     );
     const outputs = probes.flatMap((result, outputIndex) =>
       result.status === "fulfilled" ? [{ outputIndex, ...result.value }] : [],
@@ -205,10 +309,11 @@ export class NativeMediaService {
     if (!ffmpegPath) {
       throw new Error("没有找到 GameCast 原生媒体运行库");
     }
-    const encoders = await probeHardwareEncoders(ffmpegPath);
-    if (encoders.length === 0) {
+    const capabilities = await this.getCapabilities(ffmpegPath);
+    if (capabilities.encoders.length === 0) {
       throw new Error("没有检测到可用的 H.264 硬件编码器");
     }
+    this.captureBackend = capabilities.captureBackend;
 
     const socket = createSocket("udp4");
     this.rtpSocket = socket;
@@ -272,10 +377,11 @@ export class NativeMediaService {
     });
 
     let lastError: unknown;
-    for (const candidate of encoders) {
+    for (const attempt of buildEncoderAttempts(capabilities)) {
       try {
-        await this.startFfmpeg(ffmpegPath, outputIndex, candidate);
-        this.encoder = candidate;
+        await this.startFfmpeg(ffmpegPath, outputIndex, attempt.encoder, attempt.pipeline);
+        this.encoder = attempt.encoder;
+        this.pipeline = attempt.pipeline;
         break;
       } catch (error) {
         lastError = error;
@@ -289,6 +395,7 @@ export class NativeMediaService {
         : new Error("硬件编码器无法启动");
     }
     this.startMediaWatchdog();
+    this.scheduleEncoderIdleStop();
 
     let audioAnswer: string | undefined;
     let audioError: string | undefined;
@@ -304,6 +411,8 @@ export class NativeMediaService {
 
     return {
       encoder: this.encoder.label,
+      captureBackend: this.captureBackend,
+      pipeline: this.pipeline,
       width: request.preset.width,
       height: request.preset.height,
       frameRate: request.preset.frameRate,
@@ -327,24 +436,32 @@ export class NativeMediaService {
     const outputIndex = resolveNativeOutputIndex(current.sourceId, current.outputIndex);
     if (outputIndex === undefined) throw new Error("无法找到当前共享屏幕的输出编号");
     const next = { ...current, preset, maxBitrate, outputIndex, audioOffer: undefined };
-    await this.stopFfmpeg();
-    await delay(250);
+    const restartEncoder = Boolean(this.ffmpeg);
+    if (restartEncoder) {
+      await this.stopFfmpeg();
+      await delay(250);
+    }
     this.config = next;
     const ffmpegPath = resolveFfmpegPath();
     if (!ffmpegPath || outputIndex === undefined || !this.encoder) {
       throw new Error("无法重新配置原生编码器");
     }
-    try {
-      await this.startFfmpeg(ffmpegPath, outputIndex, this.encoder);
-    } catch (error) {
-      await this.stopFfmpeg().catch(() => undefined);
-      await delay(500);
-      this.config = current;
-      await this.startFfmpeg(ffmpegPath, outputIndex, this.encoder).catch(() => undefined);
-      throw error;
+    if (restartEncoder) {
+      try {
+        await this.startFfmpeg(ffmpegPath, outputIndex, this.encoder, this.pipeline);
+      } catch (error) {
+        await this.stopFfmpeg().catch(() => undefined);
+        await delay(500);
+        this.config = current;
+        await this.startFfmpeg(ffmpegPath, outputIndex, this.encoder, this.pipeline)
+          .catch(() => undefined);
+        throw error;
+      }
     }
     return {
       encoder: this.encoder.label,
+      captureBackend: this.captureBackend,
+      pipeline: this.pipeline,
       width: preset.width,
       height: preset.height,
       frameRate: preset.frameRate,
@@ -353,10 +470,23 @@ export class NativeMediaService {
     };
   }
 
-  async createOffer(connectionId: string): Promise<SessionDescriptionData> {
+  createOffer(connectionId: string): Promise<SessionDescriptionData> {
+    return this.operations.run(() => this.createOfferExclusive(connectionId));
+  }
+
+  private async createOfferExclusive(connectionId: string): Promise<SessionDescriptionData> {
     const config = this.config;
     if (!config || !this.encoder) throw new Error("原生共享尚未启动");
-    await this.closePeer(connectionId);
+    this.clearEncoderIdleTimer();
+    if (!this.ffmpeg) {
+      const ffmpegPath = resolveFfmpegPath();
+      const outputIndex = resolveNativeOutputIndex(config.sourceId, config.outputIndex);
+      if (!ffmpegPath || outputIndex === undefined) {
+        throw new Error("无法启动当前共享屏幕的原生编码器");
+      }
+      await this.startFfmpeg(ffmpegPath, outputIndex, this.encoder, this.pipeline);
+    }
+    await this.closePeerExclusive(connectionId);
 
     const pc = new RTCPeerConnection({
       codecs: {
@@ -454,7 +584,11 @@ export class NativeMediaService {
     await peer.pc.addIceCandidate(candidate ?? null);
   }
 
-  async closePeer(connectionId: string): Promise<void> {
+  closePeer(connectionId: string): Promise<void> {
+    return this.operations.run(() => this.closePeerExclusive(connectionId));
+  }
+
+  private async closePeerExclusive(connectionId: string): Promise<void> {
     const peer = this.peers.get(connectionId);
     if (!peer) return;
     this.peers.delete(connectionId);
@@ -464,6 +598,7 @@ export class NativeMediaService {
     peer.videoTrack.stop();
     peer.audioTrack?.stop();
     await closeWeriftPeer(peer.pc);
+    if (this.peers.size === 0) this.scheduleEncoderIdleStop();
   }
 
   stop(): Promise<void> {
@@ -472,9 +607,12 @@ export class NativeMediaService {
 
   private async stopExclusive(): Promise<void> {
     this.shuttingDown = true;
+    this.clearEncoderIdleTimer();
     if (this.mediaWatchdog) clearInterval(this.mediaWatchdog);
     this.mediaWatchdog = undefined;
-    for (const connectionId of [...this.peers.keys()]) await this.closePeer(connectionId);
+    for (const connectionId of [...this.peers.keys()]) {
+      await this.closePeerExclusive(connectionId);
+    }
     this.videoFanout.clear();
     this.disposeAudioTrack?.();
     this.disposeAudioTrack = undefined;
@@ -495,6 +633,23 @@ export class NativeMediaService {
     this.recoveryScheduled = false;
     this.recoveryCount = 0;
     this.rtpContinuity.reset();
+  }
+
+  private clearEncoderIdleTimer(): void {
+    if (this.encoderIdleTimer) clearTimeout(this.encoderIdleTimer);
+    this.encoderIdleTimer = undefined;
+  }
+
+  private scheduleEncoderIdleStop(): void {
+    this.clearEncoderIdleTimer();
+    if (this.shuttingDown || this.peers.size > 0 || !this.ffmpeg) return;
+    this.encoderIdleTimer = setTimeout(() => {
+      this.encoderIdleTimer = undefined;
+      void this.operations.run(async () => {
+        if (this.shuttingDown || this.peers.size > 0) return;
+        await this.stopFfmpeg();
+      });
+    }, 2_000);
   }
 
   private startMediaWatchdog(): void {
@@ -537,7 +692,7 @@ export class NativeMediaService {
     try {
       await this.stopFfmpeg();
       await delay(150);
-      await this.startFfmpeg(ffmpegPath, outputIndex, encoder);
+      await this.startFfmpeg(ffmpegPath, outputIndex, encoder, this.pipeline);
       this.emit({
         type: "encoder-recovery",
         state: "succeeded",
@@ -586,18 +741,33 @@ export class NativeMediaService {
     ffmpegPath: string,
     outputIndex: number,
     encoder: EncoderDefinition,
+    pipeline: NativeMediaPipeline,
   ): Promise<void> {
     const config = this.config;
     const socket = this.rtpSocket;
     if (!config || !socket) throw new Error("原生媒体服务尚未初始化");
     const address = socket.address();
     if (typeof address === "string") throw new Error("无法分配本机 RTP 端口");
-    const args = buildFfmpegArgs(config, outputIndex, encoder, address.port);
+    const args = buildFfmpegArgs(
+      config,
+      outputIndex,
+      encoder,
+      address.port,
+      this.captureBackend,
+      pipeline,
+    );
     this.rtpContinuity.markDiscontinuity();
     const child = spawn(ffmpegPath, args, {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    if (child.pid) {
+      try {
+        setPriority(child.pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
+      } catch {
+        // Encoding remains usable when Windows rejects priority changes.
+      }
+    }
     this.ffmpegChildren.add(child);
     child.stdout.resume();
     this.ffmpeg = child;
@@ -736,91 +906,14 @@ async function closeWeriftPeer(pc: RTCPeerConnection): Promise<void> {
   ]);
 }
 
-function buildFfmpegArgs(
-  request: NativeMediaStartRequest,
-  outputIndex: number,
-  encoder: EncoderDefinition,
-  port: number,
-): string[] {
-  const bitrate = Math.max(1_000_000, request.maxBitrate);
-  const bitrateText = `${Math.round(bitrate / 1000)}k`;
-  const bufferText = `${Math.round(bitrate / 2000)}k`;
-  const filter = [
-    "hwdownload",
-    "format=bgra",
-    `scale=${request.preset.width}:${request.preset.height}:flags=fast_bilinear`,
-  ];
-  const common = [
-    "-hide_banner",
-    "-loglevel",
-    "warning",
-    "-nostats",
-    "-stats_period",
-    "1",
-    "-progress",
-    "pipe:2",
-    "-f",
-    "lavfi",
-    "-i",
-    `ddagrab=output_idx=${outputIndex}:framerate=${request.preset.frameRate}:draw_mouse=1`,
-    "-vf",
-    filter.join(","),
-    "-an",
-    "-c:v",
-    encoder.name,
-  ];
-  const encoderArgs = (() => {
-    switch (encoder.name) {
-      case "h264_nvenc":
-        return [
-          "-preset", "p1", "-tune", "ull", "-rc", "cbr", "-profile:v", "baseline",
-          "-level", "5.1", "-bf", "0", "-zerolatency", "1", "-forced-idr", "1",
-        ];
-      case "h264_qsv":
-        return [
-          "-preset", "veryfast", "-low_power", "1", "-look_ahead", "0", "-async_depth", "2",
-          "-profile:v", "baseline", "-level", "5.1", "-bf", "0",
-        ];
-      case "h264_amf":
-        return ["-usage", "ultralowlatency", "-quality", "speed", "-rc", "cbr", "-bf", "0"];
-      case "h264_mf":
-        return ["-rate_control", "cbr", "-scenario", "video_conference"];
-    }
-  })();
-  return [
-    ...common,
-    ...encoderArgs,
-    "-b:v", bitrateText,
-    "-maxrate", bitrateText,
-    "-bufsize", bufferText,
-    // Late joiners need a decodable keyframe. Repeat SPS/PPS on each keyframe
-    // because the RTP socket is shared and packets from before a peer joined
-    // are intentionally not replayed.
-    "-g", String(Math.max(1, Math.round(request.preset.frameRate))),
-    "-keyint_min", String(Math.max(1, Math.round(request.preset.frameRate))),
-    "-force_key_frames", "expr:gte(t,n_forced*1)",
-    "-bsf:v", "dump_extra=freq=keyframe",
-    "-f", "rtp",
-    "-payload_type", String(H264_PAYLOAD_TYPE),
-    `rtp://127.0.0.1:${port}?pkt_size=1200`,
-  ];
-}
-
-async function probeHardwareEncoders(ffmpegPath: string): Promise<EncoderDefinition[]> {
+async function probeNativeMediaCapabilities(
+  ffmpegPath: string,
+): Promise<NativeMediaCapabilities> {
   const [filters, encoders] = await Promise.all([
     runFfmpegProbe(ffmpegPath, ["-hide_banner", "-filters"]),
     runFfmpegProbe(ffmpegPath, ["-hide_banner", "-encoders"]),
   ]);
-  if (!/\bddagrab\b/i.test(filters)) {
-    throw new Error("当前 FFmpeg 运行库不支持 Desktop Duplication 采集");
-  }
-  const definitions: EncoderDefinition[] = [
-    { name: "h264_nvenc", label: "NVIDIA NVENC" },
-    { name: "h264_qsv", label: "Intel Quick Sync" },
-    { name: "h264_amf", label: "AMD AMF" },
-    { name: "h264_mf", label: "Windows Media Foundation" },
-  ];
-  return definitions.filter((definition) => new RegExp(`\\b${definition.name}\\b`).test(encoders));
+  return detectNativeMediaCapabilities(filters, encoders);
 }
 
 function runFfmpegProbe(ffmpegPath: string, args: string[]): Promise<string> {
@@ -850,8 +943,24 @@ function runFfmpegProbe(ffmpegPath: string, args: string[]): Promise<string> {
 function captureNativeOutputPreview(
   ffmpegPath: string,
   outputIndex: number,
+  captureBackend: NativeCaptureBackend,
 ): Promise<{ width: number; height: number; pixels: Uint8Array }> {
   const expectedBytes = OUTPUT_PREVIEW_WIDTH * OUTPUT_PREVIEW_HEIGHT * 4;
+  const captureSource = captureBackend === "gfxcapture"
+    ? [
+        `monitor_idx=${outputIndex}`,
+        "max_framerate=5",
+        `width=${OUTPUT_PREVIEW_WIDTH}`,
+        `height=${OUTPUT_PREVIEW_HEIGHT}`,
+        "resize_mode=scale",
+        "scale_mode=bilinear",
+        "capture_cursor=0",
+        "output_fmt=8bit",
+      ].join(":")
+    : `output_idx=${outputIndex}:framerate=5:draw_mouse=0`;
+  const filter = captureBackend === "gfxcapture"
+    ? "hwdownload,format=bgra"
+    : `hwdownload,format=bgra,scale=${OUTPUT_PREVIEW_WIDTH}:${OUTPUT_PREVIEW_HEIGHT}:flags=fast_bilinear`;
   const args = [
     "-hide_banner",
     "-loglevel",
@@ -859,9 +968,9 @@ function captureNativeOutputPreview(
     "-f",
     "lavfi",
     "-i",
-    `ddagrab=output_idx=${outputIndex}:framerate=5:draw_mouse=0`,
+    `${captureBackend}=${captureSource}`,
     "-vf",
-    `hwdownload,format=bgra,scale=${OUTPUT_PREVIEW_WIDTH}:${OUTPUT_PREVIEW_HEIGHT}:flags=fast_bilinear`,
+    filter,
     "-frames:v",
     "1",
     "-pix_fmt",
@@ -923,6 +1032,9 @@ function resolveFfmpegPath(): string | undefined {
   const candidates = [
     process.env.GAMECAST_FFMPEG_PATH,
     app.isPackaged ? join(process.resourcesPath, "native", "ffmpeg.exe") : undefined,
+    app.isPackaged ? join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", "ffmpeg.exe") : undefined,
+    app.isPackaged ? join(dirname(process.execPath), "resources", "native", "ffmpeg.exe") : undefined,
+    !app.isPackaged ? join(app.getAppPath(), "native", "ffmpeg.exe") : undefined,
     getStaticFfmpegPath(),
     findJianyingFfmpeg(),
   ];

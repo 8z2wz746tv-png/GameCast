@@ -2,6 +2,7 @@ import type {
   ControlServerHealth,
   CreateRoomRequest,
   JoinRoomRequest,
+  NetworkPreflightSession,
   RoomSession,
   RoomSummary,
 } from "@gamecast/contracts";
@@ -72,6 +73,21 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = 12_000):
 export const api = {
   health(): Promise<ControlServerHealth> {
     return request<ControlServerHealth>("/health", undefined, 6_000);
+  },
+
+  networkPreflight(): Promise<NetworkPreflightSession> {
+    return request<NetworkPreflightSession>("/api/network/preflight", undefined, 8_000);
+  },
+
+  async measureUploadKbps(): Promise<number> {
+    const payload = "g".repeat(768 * 1024);
+    const startedAt = performance.now();
+    const result = await request<{ receivedBytes: number }>("/api/network/upload-probe", {
+      method: "POST",
+      body: JSON.stringify({ payload }),
+    }, 12_000);
+    const elapsedSeconds = Math.max(0.05, (performance.now() - startedAt) / 1000);
+    return Math.round((result.receivedBytes * 8) / elapsedSeconds / 1000);
   },
 
   createRoom(input: CreateRoomRequest): Promise<RoomSession> {

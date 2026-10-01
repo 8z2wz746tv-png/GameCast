@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   parseConnectionId,
+  parseEasyTierStart,
   parseIpv4Address,
   parseNativeStart,
 } from "./ipc-validation.js";
@@ -27,5 +28,11 @@ describe("Electron IPC validation", () => {
   it("rejects malformed addresses and connection identifiers", () => {
     assert.throws(() => parseIpv4Address("not-an-ip"));
     assert.throws(() => parseConnectionId("not-a-uuid"));
+  });
+
+  it("allows the main process to resolve a stored EasyTier secret", () => {
+    const parsed = parseEasyTierStart({ networkName: "friends" });
+    assert.equal(parsed.networkName, "friends");
+    assert.equal(parsed.networkSecret, "");
   });
 });

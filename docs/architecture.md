@@ -33,6 +33,10 @@ Electron / public control node
 
 `P2PSession.candidatePolicy` 由控制服务下发：`all` 表示互联网模式，`selected` 表示嵌入式模式。服务端只转发已建立观看关系对应的 SDP/ICE，并验证发送者、目标参与者和连接 ID。
 
+## 可选虚拟网络适配器
+
+桌面端提供统一的网络适配器边界。默认 `direct` 模式继续使用已有的 Tailscale、ZeroTier、WireGuard 或普通网卡；启用 `easytier` 时，Electron 主进程按房间邀请启动受控的 `easytier-core.exe`，等待虚拟网卡出现后将该地址用于嵌入式房主服务和 WebRTC host candidate 过滤。适配器启动失败只影响这次组网，不会改变公网控制节点、TURN 或 SFU 回退策略。
+
 ## 质量与资源
 
 - 1 名观看者：使用共享者上限，1080p60 每路最高 12 Mbps。
@@ -40,8 +44,10 @@ Electron / public control node
 - 4～5 名观看者：最高 720p60，每路 3.5 Mbps。
 - 6～7 名观看者：最高 720p60，每路 2.5 Mbps。
 - 连续统计到带宽不足或丢包时降低单连接码率，连续健康后逐级恢复；不超过用户选择的上限。
-- 屏幕和系统声音只捕获一次；P2P 发送使用独立 PeerConnection，SFU 发布复用同一组轨道。
-- 原生屏幕路径优先使用 Desktop Duplication 与硬件 H.264；不可用时回退 Chromium 捕获。无人观看且不需要本地预览时，辅助捕获会降载。
+- 原生视频编码一次，编码后的 RTP 复用到各 P2P PeerConnection；SFU 发布按需启用。
+- 新版媒体运行库优先使用 Windows Graphics Capture，在 D3D11 内缩放并直接交给同适配器硬件编码器。混合显卡设备会先尝试 Intel QSV VPP，最后才使用显存回读兼容路径。0.3.5 发布包内置带 `gfxcapture` 的 FFmpeg x64 构建，并在不可用时自动回退 `ddagrab`；也可通过 `GAMECAST_FFMPEG_PATH` 注入其他经过验证的运行库。
+- Chromium 只负责系统声音桥接和 SFU 兼容轨道；普通 P2P 共享时辅助画面保持 320×180、5fps，本地预览不会将它提升到全画质。
+- 无人观看时原生编码器在启动验证后自动停止，第一名观看者请求画面时恢复，最后一名观看者离开后再次停止。
 
 ## 安全与生命周期
 

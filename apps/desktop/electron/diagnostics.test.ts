@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { inflateRawSync } from "node:zlib";
-import { createZip, sanitizeDiagnosticValue } from "./diagnostics.js";
+import { createDiagnosticExport, sanitizeDiagnosticValue } from "./diagnostics.js";
 
 test("diagnostic sanitization removes secrets and raw SDP", () => {
   const sanitized = sanitizeDiagnosticValue({
@@ -24,14 +23,33 @@ test("diagnostic sanitization removes secrets and raw SDP", () => {
   });
 });
 
-test("diagnostic ZIP contains a readable deflated entry", () => {
-  const content = Buffer.from("viewer connected but decoded zero frames\n", "utf8");
-  const archive = createZip([{ name: "logs/gamecast.log", data: content }]);
-  assert.equal(archive.readUInt32LE(0), 0x04034b50);
-  const nameLength = archive.readUInt16LE(26);
-  const compressedLength = archive.readUInt32LE(18);
-  const dataOffset = 30 + nameLength;
-  const compressed = archive.subarray(dataOffset, dataOffset + compressedLength);
-  assert.deepEqual(inflateRawSync(compressed), content);
-  assert.equal(archive.readUInt32LE(archive.length - 22), 0x06054b50);
+test("diagnostic export combines metadata and all logs into one JSONL file", () => {
+  const content = Buffer.from(
+    '{"timestamp":"2026-09-01T00:00:01.000Z","scope":"viewer","event":"connected"}\n',
+    "utf8",
+  );
+  const output = createDiagnosticExport({
+    exportedAt: "2026-09-01T00:00:02.000Z",
+    metadata: {
+      appVersion: "0.3.7",
+      platform: "win32",
+      release: "10.0",
+      arch: "x64",
+      electronVersion: "43",
+      chromeVersion: "150",
+      nodeVersion: "24",
+    },
+    logFiles: [content],
+    legacyNativeLog: Buffer.from(
+      "2026-09-01T00:00:00.000Z publisher fps=60 sentPackets=1\n",
+      "utf8",
+    ),
+  });
+  const records = output.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(records.length, 3);
+  assert.equal(records[0].event, "export.metadata");
+  assert.equal(records[0].data.metadata.appVersion, "0.3.7");
+  assert.equal(records[1].event, "connected");
+  assert.equal(records[2].scope, "native-media-legacy");
+  assert.equal(records[2].data.message, "publisher fps=60 sentPackets=1");
 });

@@ -1,9 +1,9 @@
+import type { SfuSession, VideoPreset } from "@gamecast/contracts";
 import type {
   RemoteParticipant,
   RemoteTrackPublication,
   Room,
 } from "livekit-client";
-import type { SfuSession, VideoPreset } from "@gamecast/contracts";
 import { diagnosticLog, errorDetails } from "../diagnostics";
 
 type StreamWaiter = {

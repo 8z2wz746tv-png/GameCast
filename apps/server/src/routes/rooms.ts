@@ -8,9 +8,9 @@ import { z } from "zod";
 import { DomainError } from "../domain/errors.js";
 import type { MediaSessionService } from "../services/media-token-service.js";
 import type {
-  RoomService,
   ParticipantRemoval,
   RoomAccess,
+  RoomService,
 } from "../services/room-service.js";
 
 const limitsSchema = z
@@ -112,6 +112,7 @@ async function createResponse(
     signaling: { path: "/api/signal", reconnectGraceSeconds },
     p2p: mediaSessions.createP2PSession(access.participant.id),
     sfu: await mediaSessions.issueSfuSession(access.room, access.participant),
+    network: { mode: "direct" },
   };
 }
 

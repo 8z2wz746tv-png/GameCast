@@ -10,7 +10,9 @@ WebRTC P2P 直连 -> 可选 TURN -> 可选 LiveKit SFU
 
 公网模式下，用户只需安装 GameCast。公网控制节点负责房间、REST 和 WebSocket 信令；P2P 成功时屏幕与系统声音不经过控制节点。第一名观看者优先 P2P，第二名及以后在 LiveKit 可用时使用 SFU，减少共享者重复上传。项目也保留嵌入式本机房主模式，适合局域网或已有虚拟局域网的团体。
 
-屏幕共享优先使用 Windows Desktop Duplication 与硬件 H.264 编码。NVIDIA 使用 NVENC，Intel 使用 Quick Sync；原生路径只对“整个屏幕”生效，失败时自动回退 Chromium 兼容路径。系统声音通过 Electron loopback 捕获并桥接为 Opus 音频。
+嵌入式房主还可以选择内置 EasyTier 适配器，让不在同一局域网的朋友通过一个轻量虚拟网络加入。Windows 安装包包含经过版本和 SHA-256 记录的 EasyTier x64 核心及所需驱动；GameCast 只管理自己启动的进程，默认仍可使用公网控制节点、TURN 或 LiveKit。
+
+屏幕共享优先使用 Windows Graphics Capture 输出的 D3D11 显存帧，并在 GPU 内缩放后交给 NVENC、Quick Sync 或 AMF。运行库不支持 WGC 时，混合显卡笔记本会优先尝试 Intel QSV VPP，再回退 Desktop Duplication 兼容路径；原生路径只对“整个屏幕”生效，失败时自动回退 Chromium。系统声音通过 Electron loopback 捕获并桥接为 Opus，辅助视频固定为低分辨率、低帧率。0.3.5 发布包内置带 `gfxcapture` 的 FFmpeg x64 构建，并保留 `ddagrab` 兼容回退；部署者仍可通过 `GAMECAST_FFMPEG_PATH` 指向其他经过验证的 FFmpeg。
 
 ## 目录
 
@@ -64,7 +66,7 @@ npm run smoke:native
 npm run package:win
 ```
 
-`smoke:public` 会通过已配置的公网节点建立双客户端 P2P 并持续发送 RTP；`smoke:native` 会在本机第一块屏幕上验证 Desktop Duplication、硬件 H.264 和实际帧率。
+`smoke:public` 会通过已配置的公网节点建立双客户端 P2P 并持续发送 RTP；`smoke:native` 会在本机第一块屏幕上验证 WGC/Desktop Duplication、硬件 H.264 和实际帧率。
 
 发布 EXE 不提交到 Git 仓库；请通过 GitHub Releases 或其他制品存储分发。当前安装包没有商业代码签名证书，Windows 可能显示“未知发布者”。异地朋友测试前请阅读 [`docs/friends-test-checklist.md`](docs/friends-test-checklist.md)。
 

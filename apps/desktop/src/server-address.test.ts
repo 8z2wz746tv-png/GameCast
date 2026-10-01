@@ -15,7 +15,7 @@ describe("control server address classification", () => {
   });
 
   it("allows public IPs and hostnames", () => {
-    assert.equal(isPrivateControlServerUrl("https://129.28.42.189"), false);
+    assert.equal(isPrivateControlServerUrl("https://203.0.113.10"), false);
     assert.equal(isPrivateControlServerUrl("https://control.gamecast.example"), false);
   });
 });

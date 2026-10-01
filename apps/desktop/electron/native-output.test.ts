@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   matchNativeOutputPreviews,
-  resolveNativeOutputIndex,
   type NativePreviewFrame,
+  resolveNativeOutputIndex,
 } from "./native-output.js";
 
 describe("native screen output mapping", () => {

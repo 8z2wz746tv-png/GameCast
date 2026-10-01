@@ -7,7 +7,7 @@ import type {
   ServerSignalMessage,
 } from "@gamecast/contracts";
 import WebSocket from "ws";
-import { startControlServer, type ControlServerHandle } from "./app.js";
+import { type ControlServerHandle, startControlServer } from "./app.js";
 
 class TestSignalClient {
   private readonly messages: ServerSignalMessage[] = [];
@@ -94,6 +94,14 @@ describe("P2P signaling integration", () => {
       status: "ok",
       p2p: true,
     });
+
+    const uploadResponse = await fetch(`${handle.url}/api/network/upload-probe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ payload: "x".repeat(32 * 1024) }),
+    });
+    assert.equal(uploadResponse.status, 200);
+    assert.deepEqual(await uploadResponse.json(), { receivedBytes: 32 * 1024 });
 
     const session = await createRoom(handle.url);
     assert.equal(session.p2p.candidatePolicy, "all");

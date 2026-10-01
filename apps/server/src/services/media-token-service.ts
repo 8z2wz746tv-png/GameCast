@@ -5,11 +5,11 @@ import type {
   SfuSession,
 } from "@gamecast/contracts";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
-import type { Participant, Room } from "../domain/room.js";
 import type {
   LiveKitRuntimeConfig,
   TurnRuntimeConfig,
 } from "../config.js";
+import type { Participant, Room } from "../domain/room.js";
 
 const TOKEN_TTL_SECONDS = 6 * 60 * 60;
 const AVAILABILITY_CACHE_MS = 30_000;

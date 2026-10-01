@@ -1,3 +1,23 @@
+import { execFile } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { arch, networkInterfaces, release } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import type {
+  IceCandidateData,
+  SessionDescriptionData,
+  VideoPreset,
+} from "@gamecast/contracts";
+import type {
+  ControlServerRuntimeConfig,
+  LiveKitRuntimeConfig,
+  TurnRuntimeConfig,
+} from "@gamecast/server/config";
+import {
+  type ControlServerHandle,
+  startControlServer,
+} from "@gamecast/server/embedded";
 import {
   app,
   BrowserWindow,
@@ -7,37 +27,15 @@ import {
   session,
   shell,
 } from "electron";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { arch, networkInterfaces, release } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
-  startControlServer,
-  type ControlServerHandle,
-} from "@gamecast/server/embedded";
-import type {
-  ControlServerRuntimeConfig,
-  LiveKitRuntimeConfig,
-  TurnRuntimeConfig,
-} from "@gamecast/server/config";
-import {
-  NativeMediaService,
-  type NativeMediaEvent,
-  type NativeMediaStartRequest,
-} from "./native-media.js";
-import {
-  DiagnosticsService,
   type DiagnosticLogEntry,
+  DiagnosticsService,
 } from "./diagnostics.js";
-import type {
-  IceCandidateData,
-  SessionDescriptionData,
-  VideoPreset,
-} from "@gamecast/contracts";
-import { AsyncLineWriter } from "./async-line-writer.js";
 import {
+  type HostSettingsInput,
   parseBitrate,
   parseConnectionId,
+  parseEasyTierStart,
   parseHostSettings,
   parseIceCandidate,
   parseIpv4Address,
@@ -45,8 +43,16 @@ import {
   parsePreset,
   parseSessionDescription,
   parseSourceId,
-  type HostSettingsInput,
 } from "./ipc-validation.js";
+import {
+  type NativeMediaEvent,
+  NativeMediaService,
+  type NativeMediaStartRequest,
+} from "./native-media.js";
+import {
+  EmbeddedEasyTierAdapter,
+  type NetworkAdapterStatus,
+} from "./network-adapter.js";
 
 app.commandLine.appendSwitch("disable-features", "WebRtcHideLocalIpsWithMdns");
 app.commandLine.appendSwitch("ignore-gpu-blocklist");
@@ -58,19 +64,24 @@ app.commandLine.appendSwitch(
 );
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
+const execFileAsync = promisify(execFile);
 let selectedSourceId: string | undefined;
 let selectedNativeOutputIndex: number | undefined;
 const nativeOutputIndexes = new Map<string, number>();
 let hostedServer: ControlServerHandle | undefined;
 let diagnostics: DiagnosticsService | undefined;
-let nativeLogWriter: AsyncLineWriter | undefined;
 const nativeMedia = new NativeMediaService((event) => broadcastNativeMediaEvent(event));
+let networkAdapter: EmbeddedEasyTierAdapter | undefined;
+let pendingProtocolUrl: string | undefined;
+
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) app.quit();
 
 type NetworkCandidate = {
   id: string;
   name: string;
   address: string;
-  kind: "tailscale" | "zerotier" | "wireguard" | "other";
+  kind: "easytier" | "tailscale" | "zerotier" | "wireguard" | "other";
   recommended: boolean;
 };
 
@@ -78,12 +89,16 @@ type HostSettingsSecrets = {
   turnSharedSecret?: string;
   livekitApiKey?: string;
   livekitApiSecret?: string;
+  easyTierNetworkSecret?: string;
 };
 
 type PersistedHostSettings = {
   turnUrls: string;
   livekitServerUrl: string;
   encryptedSecrets?: string;
+  easyTierPath?: string;
+  easyTierNetworkName?: string;
+  easyTierPeers?: string[];
 };
 
 function registerCaptureHandlers(): void {
@@ -170,6 +185,23 @@ function registerCaptureHandlers(): void {
 }
 
 function registerNativeMediaHandlers(): void {
+  ipcMain.handle(
+    "native-media:preflight",
+    async (_event, sourceId: string, preset: VideoPreset, requiredUploadKbps: number) => {
+      sourceId = parseSourceId(sourceId);
+      preset = parsePreset(preset);
+      requiredUploadKbps = Math.max(500, Math.min(50_000, Number(requiredUploadKbps) || 0));
+      const outputIndex = nativeOutputIndexes.get(sourceId);
+      const result = await nativeMedia.preflight(
+        sourceId,
+        outputIndex,
+        preset,
+        requiredUploadKbps,
+      );
+      diagnostics?.log({ scope: "capture", event: "preflight.completed", data: result });
+      return result;
+    },
+  );
   ipcMain.handle("native-media:start", async (_event, request: NativeMediaStartRequest) => {
     request = parseNativeStart(request);
     const outputIndex = request.sourceId === selectedSourceId
@@ -184,7 +216,9 @@ function registerNativeMediaHandlers(): void {
       }
       const result = await nativeMedia.start({ ...request, outputIndex });
       writeNativeMediaLog(
-        `started source=${request.sourceId} output=${String(outputIndex)} encoder=${result.encoder} ${result.width}x${result.height}@${result.frameRate} audio=${result.hasSystemAudio ? "connected" : request.audioOffer ? `failed (${result.audioError ?? "unknown error"})` : "not captured"}`,
+        `started source=${request.sourceId} output=${String(outputIndex)} encoder=${result.encoder} ` +
+        `capture=${result.captureBackend} pipeline=${result.pipeline} ` +
+        `${result.width}x${result.height}@${result.frameRate} audio=${result.hasSystemAudio ? "connected" : request.audioOffer ? `failed (${result.audioError ?? "unknown error"})` : "not captured"}`,
       );
       return result;
     } catch (error) {
@@ -206,7 +240,8 @@ function registerNativeMediaHandlers(): void {
       try {
         const result = await nativeMedia.updatePreset(preset, maxBitrate);
         writeNativeMediaLog(
-          `preset update completed ${result.width}x${result.height}@${result.frameRate} bitrate=${result.bitrateKbps}`,
+          `preset update completed ${result.width}x${result.height}@${result.frameRate} ` +
+          `bitrate=${result.bitrateKbps} capture=${result.captureBackend} pipeline=${result.pipeline}`,
         );
         return result;
       } catch (error) {
@@ -245,6 +280,74 @@ function registerNativeMediaHandlers(): void {
   });
 }
 
+function registerAppHandlers(): void {
+  ipcMain.handle("app:get-version", () => app.getVersion());
+  ipcMain.handle("app:get-pending-invitation", () => {
+    const value = pendingProtocolUrl;
+    pendingProtocolUrl = undefined;
+    return value;
+  });
+  ipcMain.handle("app:check-update", async () => {
+    const response = await fetch(
+      "https://api.github.com/repos/8z2wz746tv-png/GameCast/releases/latest",
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": `GameCast/${app.getVersion()}`,
+        },
+        signal: AbortSignal.timeout(8_000),
+      },
+    );
+    if (!response.ok) throw new Error(`版本服务返回 ${response.status}`);
+    const release = await response.json() as {
+      tag_name?: string;
+      name?: string;
+      body?: string;
+      html_url?: string;
+      published_at?: string;
+    };
+    const releaseUrl = release.html_url;
+    if (!releaseUrl || !isTrustedReleaseUrl(releaseUrl)) throw new Error("版本服务返回了无效地址");
+    return {
+      currentVersion: app.getVersion(),
+      latestVersion: (release.tag_name ?? "").replace(/^v/i, ""),
+      name: release.name ?? release.tag_name ?? "最新版本",
+      notes: (release.body ?? "").slice(0, 8_000),
+      releaseUrl,
+      publishedAt: release.published_at,
+    };
+  });
+  ipcMain.handle("app:open-release", async (_event, releaseUrl: string) => {
+    if (!isTrustedReleaseUrl(releaseUrl)) throw new Error("只允许打开 GameCast 官方发布页");
+    await shell.openExternal(releaseUrl);
+  });
+}
+
+function isTrustedReleaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      url.hostname === "github.com" &&
+      url.pathname.startsWith("/8z2wz746tv-png/GameCast/releases");
+  } catch {
+    return false;
+  }
+}
+
+function extractProtocolUrl(argv: string[]): string | undefined {
+  return argv.find((value) => /^gamecast:\/\//i.test(value));
+}
+
+function dispatchProtocolUrl(value: string): void {
+  pendingProtocolUrl = value;
+  const window = BrowserWindow.getAllWindows()[0];
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  window.webContents.send("app:invitation", value);
+}
+
 function broadcastNativeMediaEvent(event: NativeMediaEvent): void {
   if (event.type === "error") writeNativeMediaLog(`runtime error=${event.message}`);
   if (event.type === "publisher-stats") {
@@ -271,7 +374,6 @@ function broadcastNativeMediaEvent(event: NativeMediaEvent): void {
 
 function writeNativeMediaLog(message: string): void {
   try {
-    nativeLogWriter?.write(`${new Date().toISOString()} ${message}\n`);
     diagnostics?.log({ scope: "native-media", event: "message", data: { message } });
   } catch {
     // Diagnostics must never interrupt media startup.
@@ -280,6 +382,56 @@ function writeNativeMediaLog(message: string): void {
 
 function registerHostHandlers(): void {
   ipcMain.handle("host:list-networks", () => listNetworkCandidates());
+  ipcMain.handle("network:list", () => listNetworkCandidates());
+  ipcMain.handle("network:get-status", () => networkAdapter?.status ?? createDirectNetworkStatus());
+  ipcMain.handle("network:start", async (_event, input: unknown) => {
+    if (!networkAdapter) throw new Error("网络适配器尚未初始化");
+    const parsed = parseEasyTierStart(input);
+    const savedSecret = decryptSecrets(readHostSettings()).easyTierNetworkSecret;
+    const networkRequest = {
+      ...parsed,
+      networkSecret: parsed.networkSecret || savedSecret || "",
+    };
+    diagnostics?.log({
+      scope: "network",
+      event: "easytier.start.requested",
+      data: { networkName: parsed.networkName, peerCount: parsed.peers?.length ?? 0 },
+    });
+    try {
+      const result = await networkAdapter.start(networkRequest);
+      diagnostics?.log({
+        scope: "network",
+        event: "easytier.started",
+        data: { state: result.state, virtualIp: result.virtualIp, interfaceName: result.interfaceName },
+      });
+      return result;
+    } catch (error) {
+      diagnostics?.log({
+        level: "error",
+        scope: "network",
+        event: "easytier.start.failed",
+        data: { error: error instanceof Error ? error.message : String(error) },
+      });
+      throw error;
+    }
+  });
+  ipcMain.handle("network:stop", async () => {
+    await networkAdapter?.stop();
+    diagnostics?.log({ scope: "network", event: "easytier.stopped" });
+  });
+  ipcMain.handle("network:diagnostics", async () =>
+    networkAdapter?.diagnostics() ?? { status: createDirectNetworkStatus(), interfaces: [] },
+  );
+  ipcMain.handle("network:local-preflight", async () => {
+    const networkStatus = networkAdapter?.status ?? createDirectNetworkStatus();
+    const candidates = listNetworkCandidates();
+    return {
+      networkStatus,
+      firewallEnabled: await readWindowsFirewallState(),
+      interfaceCount: candidates.length,
+      recommendedInterfaceCount: candidates.filter((candidate) => candidate.recommended).length,
+    };
+  });
   ipcMain.handle("host:get-settings", () => getPublicHostSettings());
   ipcMain.handle("host:save-settings", (_event, input: HostSettingsInput) => {
     input = parseHostSettings(input);
@@ -323,6 +475,40 @@ function registerHostHandlers(): void {
   });
 }
 
+async function readWindowsFirewallState(): Promise<boolean | undefined> {
+  const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+  const powershell = join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  try {
+    const { stdout } = await execFileAsync(
+      powershell,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[bool](Get-NetFirewallProfile | Where-Object Enabled)",
+      ],
+      { windowsHide: true, timeout: 3_000 },
+    );
+    const value = stdout.trim().toLowerCase();
+    if (value === "true") return true;
+    if (value === "false") return false;
+  } catch (error) {
+    diagnostics?.log({
+      level: "warn",
+      scope: "network",
+      event: "firewall-state.failed",
+      data: { error: error instanceof Error ? error.message : String(error) },
+    });
+  }
+  return undefined;
+}
+
 function registerDiagnosticHandlers(): void {
   ipcMain.on("diagnostics:log", (_event, entry: DiagnosticLogEntry) => {
     if (!entry || typeof entry.scope !== "string" || typeof entry.event !== "string") return;
@@ -331,7 +517,6 @@ function registerDiagnosticHandlers(): void {
   ipcMain.handle("diagnostics:export", async () => {
     if (!diagnostics) throw new Error("诊断日志服务尚未启动");
     diagnostics.log({ scope: "diagnostics", event: "export.requested" });
-    await nativeLogWriter?.flush();
     const path = await diagnostics.exportBundle();
     shell.showItemInFolder(path);
     return { path };
@@ -364,10 +549,20 @@ function listNetworkCandidates(): NetworkCandidate[] {
 }
 
 function detectNetworkKind(name: string): NetworkCandidate["kind"] {
+  if (/easytier/i.test(name)) return "easytier";
   if (/tailscale/i.test(name)) return "tailscale";
   if (/zerotier/i.test(name)) return "zerotier";
   if (/wireguard|wintun/i.test(name)) return "wireguard";
   return "other";
+}
+
+function createDirectNetworkStatus(): NetworkAdapterStatus {
+  return {
+    mode: "direct",
+    state: "disabled",
+    peerCount: 0,
+    recentLogs: [],
+  };
 }
 
 async function startHostedServer(address: string) {
@@ -455,6 +650,10 @@ function getPublicHostSettings() {
     hasTurnSecret: Boolean(secrets.turnSharedSecret),
     hasLivekitCredentials: Boolean(secrets.livekitApiKey && secrets.livekitApiSecret),
     encryptionAvailable: safeStorage.isEncryptionAvailable(),
+    easyTierPath: settings.easyTierPath ?? "",
+    easyTierNetworkName: settings.easyTierNetworkName ?? "",
+    easyTierPeers: settings.easyTierPeers ?? [],
+    hasEasyTierSecret: Boolean(secrets.easyTierNetworkSecret),
   };
 }
 
@@ -469,10 +668,15 @@ function saveHostSettings(input: HostSettingsInput): void {
   if (input.turnSharedSecret?.trim()) secrets.turnSharedSecret = input.turnSharedSecret.trim();
   if (input.livekitApiKey?.trim()) secrets.livekitApiKey = input.livekitApiKey.trim();
   if (input.livekitApiSecret?.trim()) secrets.livekitApiSecret = input.livekitApiSecret.trim();
+  if (input.clearEasyTierSecret) delete secrets.easyTierNetworkSecret;
+  if (input.easyTierNetworkSecret?.trim()) secrets.easyTierNetworkSecret = input.easyTierNetworkSecret.trim();
 
   const persisted: PersistedHostSettings = {
     turnUrls: input.turnUrls.trim(),
     livekitServerUrl: input.livekitServerUrl.trim(),
+    easyTierPath: input.easyTierPath?.trim() ?? existing.easyTierPath,
+    easyTierNetworkName: input.easyTierNetworkName?.trim() ?? existing.easyTierNetworkName,
+    easyTierPeers: parsePeerList(input.easyTierPeers ?? existing.easyTierPeers?.join(",")),
   };
   if (safeStorage.isEncryptionAvailable() && Object.keys(secrets).length > 0) {
     persisted.encryptedSecrets = safeStorage
@@ -488,7 +692,7 @@ function readHostSettings(): PersistedHostSettings {
   try {
     return JSON.parse(readFileSync(hostSettingsPath(), "utf8")) as PersistedHostSettings;
   } catch {
-    return { turnUrls: "", livekitServerUrl: "" };
+    return { turnUrls: "", livekitServerUrl: "", easyTierPeers: [] };
   }
 }
 
@@ -501,6 +705,15 @@ function decryptSecrets(settings: PersistedHostSettings): HostSettingsSecrets {
   } catch {
     return {};
   }
+}
+
+function parsePeerList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(/[\r\n,;；]+/)
+    .map((peer) => peer.trim())
+    .filter(Boolean)
+    .slice(0, 16);
 }
 
 function hostSettingsPath(): string {
@@ -532,7 +745,24 @@ async function createWindow(): Promise<void> {
   else await window.loadFile(join(__dirname, "../dist/index.html"));
 }
 
+app.on("second-instance", (_event, argv) => {
+  const protocolUrl = extractProtocolUrl(argv);
+  if (protocolUrl) dispatchProtocolUrl(protocolUrl);
+  else {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (window?.isMinimized()) window.restore();
+    window?.show();
+    window?.focus();
+  }
+});
+
 app.whenReady().then(async () => {
+  if (process.defaultApp && process.argv[1]) {
+    app.setAsDefaultProtocolClient("gamecast", process.execPath, [process.argv[1]]);
+  } else {
+    app.setAsDefaultProtocolClient("gamecast");
+  }
+  pendingProtocolUrl = extractProtocolUrl(process.argv);
   diagnostics = new DiagnosticsService(app.getPath("userData"), app.getPath("desktop"), {
     appVersion: app.getVersion(),
     platform: process.platform,
@@ -542,16 +772,18 @@ app.whenReady().then(async () => {
     chromeVersion: process.versions.chrome ?? "unknown",
     nodeVersion: process.versions.node,
   });
-  nativeLogWriter = new AsyncLineWriter(
-    join(app.getPath("userData"), "native-media.log"),
-    10 * 1024 * 1024,
-    5,
-  );
+  networkAdapter = new EmbeddedEasyTierAdapter({
+    resourcesPath: process.resourcesPath,
+    appPath: app.getAppPath(),
+    userDataPath: app.getPath("userData"),
+    log: (line) => diagnostics?.log({ scope: "network", event: "easytier.output", data: { line } }),
+  });
   diagnostics.log({ scope: "app", event: "started" });
   registerDiagnosticHandlers();
   registerCaptureHandlers();
   registerHostHandlers();
   registerNativeMediaHandlers();
+  registerAppHandlers();
   await createWindow();
   app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) await createWindow();
@@ -561,8 +793,8 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", async () => {
   diagnostics?.log({ scope: "app", event: "window-all-closed" });
   await nativeMedia.stop().catch(() => undefined);
+  await networkAdapter?.stop().catch(() => undefined);
   await stopHostedServer().catch(() => undefined);
-  await nativeLogWriter?.flush().catch(() => undefined);
   await diagnostics?.close().catch(() => undefined);
   if (process.platform !== "darwin") app.quit();
 });

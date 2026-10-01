@@ -5,6 +5,7 @@ import type {
 } from "@gamecast/contracts";
 import { z } from "zod";
 import type { NativeMediaStartRequest } from "./native-media.js";
+import type { EasyTierStartRequest } from "./network-adapter.js";
 
 export type HostSettingsInput = {
   turnUrls: string;
@@ -14,6 +15,11 @@ export type HostSettingsInput = {
   livekitApiSecret?: string;
   clearTurnSecret?: boolean;
   clearLivekitCredentials?: boolean;
+  easyTierPath?: string;
+  easyTierNetworkName?: string;
+  easyTierNetworkSecret?: string;
+  easyTierPeers?: string;
+  clearEasyTierSecret?: boolean;
 };
 
 const sourceIdSchema = z.string().min(1).max(512);
@@ -57,6 +63,18 @@ const hostSettingsSchema = z.object({
   livekitApiSecret: z.string().max(4_096).optional(),
   clearTurnSecret: z.boolean().optional(),
   clearLivekitCredentials: z.boolean().optional(),
+  easyTierPath: z.string().max(2_048).optional(),
+  easyTierNetworkName: z.string().max(128).optional(),
+  easyTierNetworkSecret: z.string().max(4_096).optional(),
+  easyTierPeers: z.string().max(8_192).optional(),
+  clearEasyTierSecret: z.boolean().optional(),
+});
+const easyTierStartSchema = z.object({
+  executablePath: z.string().max(2_048).optional(),
+  networkName: z.string().trim().min(1).max(128),
+  networkSecret: z.string().trim().min(1).max(4_096).optional(),
+  peers: z.array(z.string().trim().min(1).max(2_048)).max(16).optional(),
+  virtualIp: z.ipv4().optional(),
 });
 
 export const parseSourceId = (value: unknown): string => sourceIdSchema.parse(value);
@@ -72,3 +90,7 @@ export const parseIceCandidate = (value: unknown): IceCandidateData | null =>
   iceCandidateSchema.parse(value) as IceCandidateData | null;
 export const parseHostSettings = (value: unknown): HostSettingsInput =>
   hostSettingsSchema.parse(value) as HostSettingsInput;
+export const parseEasyTierStart = (value: unknown): EasyTierStartRequest => {
+  const parsed = easyTierStartSchema.parse(value);
+  return { ...parsed, networkSecret: parsed.networkSecret ?? "" } as EasyTierStartRequest;
+};

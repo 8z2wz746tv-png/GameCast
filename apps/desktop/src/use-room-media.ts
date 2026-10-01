@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   MediaTransport,
   ParticipantSummary,
@@ -8,19 +7,21 @@ import type {
   ShareDescriptor,
   VideoPreset,
 } from "@gamecast/contracts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getApiBaseUrl } from "./api";
+import { diagnosticLog, errorDetails } from "./diagnostics";
 import { VIDEO_PRESETS } from "./media";
 import {
-  P2PMediaManager,
   type MediaStats,
+  type MediaConnectionStage,
+  P2PMediaManager,
 } from "./p2p/p2p-media-manager";
+import { SfuFallback } from "./p2p/sfu-fallback";
 import {
   createSignalUrl,
-  SignalingClient,
   type SignalConnectionState,
+  SignalingClient,
 } from "./p2p/signaling-client";
-import { SfuFallback } from "./p2p/sfu-fallback";
-import { diagnosticLog, errorDetails } from "./diagnostics";
 
 export type MediaConnectionState =
   | "connecting"
@@ -49,9 +50,14 @@ export function useRoomMedia(session: RoomSession) {
   const [mediaError, setMediaError] = useState("");
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
+  const [localPreviewStream, setLocalPreviewStream] = useState<MediaStream | null>(null);
   const [hasSystemAudio, setHasSystemAudio] = useState(false);
   const [stats, setStats] = useState<MediaStats | undefined>();
   const [publisherStats, setPublisherStats] = useState<MediaStats | undefined>();
+  const [connectionStage, setConnectionStage] = useState<MediaConnectionStage>({
+    phase: "idle",
+    message: "未选择共享画面",
+  });
   const [captureMode, setCaptureMode] = useState<"browser" | "native" | null>(null);
   const [encoder, setEncoder] = useState<string | undefined>();
   const managerRef = useRef<P2PMediaManager | undefined>(undefined);
@@ -159,6 +165,7 @@ export function useRoomMedia(session: RoomSession) {
           ) => {
             if (disposed) return;
             setIsSharing(active);
+            setLocalPreviewStream(active ? stream ?? null : null);
             setHasSystemAudio(audioAvailable);
             setCaptureMode(active ? nextCaptureMode : null);
             setEncoder(active ? nextEncoder : undefined);
@@ -175,6 +182,7 @@ export function useRoomMedia(session: RoomSession) {
           },
           onStats: (nextStats) => !disposed && setStats(nextStats),
           onPublisherStats: (nextStats) => !disposed && setPublisherStats(nextStats),
+          onConnectionStage: (stage) => !disposed && setConnectionStage(stage),
         },
         VIDEO_PRESETS[2]!,
       );
@@ -256,21 +264,62 @@ export function useRoomMedia(session: RoomSession) {
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    video.srcObject = selectedStream;
-    diagnosticLog("viewer", "video.src-object", {
-      attached: Boolean(selectedStream),
-      tracks: selectedStream?.getTracks().map((track) => ({
-        kind: track.kind,
-        id: track.id,
-        muted: track.muted,
-        readyState: track.readyState,
-      })),
-    });
-    if (selectedStream) {
+    let disposed = false;
+    let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+    let recoveryAttempts = 0;
+    // Keep the video element isolated from the system-audio bridge. Chromium
+    // reports audio decode failures on the video element for a combined stream,
+    // even while video RTP is still decoding successfully.
+    const displayStream = selectedStream
+      ? new MediaStream(selectedStream.getVideoTracks())
+      : null;
+    const attach = (reason: "initial" | "decode-recovery") => {
+      if (disposed || !displayStream) return;
+      video.srcObject = displayStream;
+      video.muted = true;
+      video.autoplay = true;
+      diagnosticLog("viewer", "video.src-object", {
+        attached: true,
+        reason,
+        tracks: displayStream.getTracks().map((track) => ({
+          kind: track.kind,
+          id: track.id,
+          muted: track.muted,
+          readyState: track.readyState,
+        })),
+      });
       void video.play()
-        .then(() => diagnosticLog("viewer", "video.play.resolved"))
-        .catch((error) => diagnosticLog("viewer", "video.play.rejected", errorDetails(error), "error"));
-    }
+        .then(() => diagnosticLog("viewer", "video.play.resolved", { reason }))
+        .catch((error) => diagnosticLog("viewer", "video.play.rejected", { reason, ...errorDetails(error) }, "error"));
+    };
+    const recoverFromDecodeError = () => {
+      if (disposed || !displayStream || video.srcObject !== displayStream) return;
+      if (recoveryAttempts >= 2) {
+        diagnosticLog("viewer", "video.decode-recovery.exhausted", {
+          attempts: recoveryAttempts,
+        }, "error");
+        return;
+      }
+      recoveryAttempts += 1;
+      const attempt = recoveryAttempts;
+      diagnosticLog("viewer", "video.decode-recovery.scheduled", { attempt }, "warn");
+      video.pause();
+      video.srcObject = null;
+      video.load();
+      recoveryTimer = setTimeout(() => {
+        recoveryTimer = undefined;
+        if (disposed) return;
+        diagnosticLog("viewer", "video.decode-recovery.started", { attempt }, "warn");
+        attach("decode-recovery");
+      }, attempt * 150);
+    };
+    const onVideoError = () => {
+      // Chromium exposes MEDIA_ERR_DECODE as code 3. Use the numeric value so
+      // this also works in Electron contexts where MediaError is not global.
+      if (video.error?.code === 3) recoverFromDecodeError();
+    };
+    video.addEventListener("error", onVideoError);
+    attach("initial");
     const timer = selectedStream
       ? setInterval(() => {
           diagnosticLog("viewer", "video.element-state", {
@@ -285,8 +334,11 @@ export function useRoomMedia(session: RoomSession) {
         }, 15_000)
       : undefined;
     return () => {
+      disposed = true;
+      video.removeEventListener("error", onVideoError);
       if (timer) clearInterval(timer);
-      if (video.srcObject === selectedStream) video.srcObject = null;
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      if (video.srcObject === displayStream) video.srcObject = null;
     };
   }, [selectedStream]);
 
@@ -336,7 +388,10 @@ export function useRoomMedia(session: RoomSession) {
     const audio = audioRef.current;
     if (!audio) return;
     const isLocal = displayedSharerId === session.participant.id;
-    audio.srcObject = isLocal ? null : selectedStream;
+    const audioStream = isLocal || !selectedStream
+      ? null
+      : new MediaStream(selectedStream.getAudioTracks());
+    audio.srcObject = audioStream;
     if (audio.srcObject) {
       audio.play().catch((error) => {
         diagnosticLog("viewer", "audio.play.rejected", errorDetails(error), "warn");
@@ -344,7 +399,7 @@ export function useRoomMedia(session: RoomSession) {
       });
     }
     return () => {
-      if (audio.srcObject === selectedStream) audio.srcObject = null;
+      if (audio.srcObject === audioStream) audio.srcObject = null;
     };
   }, [displayedSharerId, selectedStream, session.participant.id]);
 
@@ -389,6 +444,7 @@ export function useRoomMedia(session: RoomSession) {
   }, []);
 
   const retryConnection = useCallback(() => signalingRef.current?.reconnect(), []);
+  const retryMediaConnection = useCallback(() => managerRef.current?.retrySelectedShare(), []);
   const resumeAudio = useCallback(async () => {
     await audioRef.current?.play();
     setAudioBlocked(false);
@@ -405,10 +461,13 @@ export function useRoomMedia(session: RoomSession) {
     updateSharePreset,
     stopSharing,
     isSharing,
+    localPreviewStream,
     hasSystemAudio,
     connectionState,
     mediaError,
     retryConnection,
+    retryMediaConnection,
+    connectionStage,
     audioBlocked,
     resumeAudio,
     participantCount: participants.length,

@@ -1,6 +1,6 @@
 import type { ClientSignalMessage } from "@gamecast/contracts";
-import { z } from "zod";
 import type { RawData } from "ws";
+import { z } from "zod";
 
 const descriptionSchema = z.object({
   type: z.enum(["offer", "answer"]),

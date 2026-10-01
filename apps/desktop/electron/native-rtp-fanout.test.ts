@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { NativeRtpFanout, isNativeRtpStalled } from "./native-rtp-fanout.js";
+import { isNativeRtpStalled, NativeRtpFanout } from "./native-rtp-fanout.js";
 
 describe("native RTP direct fanout", () => {
   it("forwards a sustained 1080p60-style packet stream without a timer queue", () => {

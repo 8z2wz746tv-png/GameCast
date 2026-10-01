@@ -18,8 +18,44 @@ export type NetworkInterfaceCandidate = {
   id: string;
   name: string;
   address: string;
-  kind: "tailscale" | "zerotier" | "wireguard" | "other";
+  kind: "easytier" | "tailscale" | "zerotier" | "wireguard" | "other";
   recommended: boolean;
+};
+
+export type NetworkAdapterStatus = {
+  mode: "direct" | "easytier";
+  state: "disabled" | "starting" | "connected" | "stopped" | "failed";
+  virtualIp?: string;
+  interfaceName?: string;
+  pid?: number;
+  executablePath?: string;
+  networkName?: string;
+  peerCount: number;
+  lastError?: string;
+  recentLogs: string[];
+};
+
+export type NetworkInterfaceDiagnostic = {
+  name: string;
+  address: string;
+  family: string;
+  internal: boolean;
+  kind: "easytier" | "tailscale" | "zerotier" | "wireguard" | "other";
+};
+
+export type LocalNetworkPreflight = {
+  networkStatus: NetworkAdapterStatus;
+  firewallEnabled?: boolean;
+  interfaceCount: number;
+  recommendedInterfaceCount: number;
+};
+
+export type EasyTierStartInput = {
+  executablePath?: string;
+  networkName: string;
+  networkSecret?: string;
+  peers?: string[];
+  virtualIp?: string;
 };
 
 export type HostSettingsStatus = {
@@ -28,6 +64,10 @@ export type HostSettingsStatus = {
   hasTurnSecret: boolean;
   hasLivekitCredentials: boolean;
   encryptionAvailable: boolean;
+  easyTierPath: string;
+  easyTierNetworkName: string;
+  easyTierPeers: string[];
+  hasEasyTierSecret: boolean;
 };
 
 export type HostSettingsInput = {
@@ -38,6 +78,11 @@ export type HostSettingsInput = {
   livekitApiSecret?: string;
   clearTurnSecret?: boolean;
   clearLivekitCredentials?: boolean;
+  easyTierPath?: string;
+  easyTierNetworkName?: string;
+  easyTierNetworkSecret?: string;
+  easyTierPeers?: string;
+  clearEasyTierSecret?: boolean;
 };
 
 export type HostedServerInfo = {
@@ -62,6 +107,8 @@ export type NativeMediaStartRequest = {
 
 export type NativeMediaStartResult = {
   encoder: string;
+  captureBackend: "gfxcapture" | "ddagrab";
+  pipeline: "gpu" | "compatibility";
   width: number;
   height: number;
   frameRate: number;
@@ -69,6 +116,29 @@ export type NativeMediaStartResult = {
   hasSystemAudio: boolean;
   audioAnswer?: string;
   audioError?: string;
+};
+
+export type NativeMediaPreflightResult = {
+  sourceKind: "screen" | "window";
+  nativeAvailable: boolean;
+  outputMapped: boolean;
+  captureBackend?: "gfxcapture" | "ddagrab";
+  encoders: string[];
+  recommendedEncoder?: string;
+  targetWidth: number;
+  targetHeight: number;
+  targetFrameRate: number;
+  requiredUploadKbps: number;
+  issues: string[];
+};
+
+export type AppUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  name: string;
+  notes: string;
+  releaseUrl: string;
+  publishedAt?: string;
 };
 
 export type NativeMediaEvent =
@@ -122,6 +192,16 @@ declare global {
       listCaptureSources: () => Promise<CaptureSource[]>;
       selectCaptureSource: (sourceId: string) => Promise<void>;
       listNetworkInterfaces: () => Promise<NetworkInterfaceCandidate[]>;
+      getNetworkStatus: () => Promise<NetworkAdapterStatus>;
+      startNetwork: (input: EasyTierStartInput) => Promise<NetworkAdapterStatus>;
+      stopNetwork: () => Promise<void>;
+      getNetworkDiagnostics: () => Promise<{ status: NetworkAdapterStatus; interfaces: NetworkInterfaceDiagnostic[] }>;
+      getLocalNetworkPreflight: () => Promise<LocalNetworkPreflight>;
+      preflightNativeMedia: (
+        sourceId: string,
+        preset: VideoPreset,
+        requiredUploadKbps: number,
+      ) => Promise<NativeMediaPreflightResult>;
       getHostSettings: () => Promise<HostSettingsStatus>;
       saveHostSettings: (settings: HostSettingsInput) => Promise<HostSettingsStatus>;
       startHostServer: (address: string) => Promise<HostedServerInfo>;
@@ -144,6 +224,11 @@ declare global {
       stopNativeMedia: () => Promise<void>;
       logDiagnostic: (entry: DiagnosticLogEntry) => void;
       exportDiagnostics: () => Promise<{ path: string }>;
+      getAppVersion: () => Promise<string>;
+      checkForUpdates: () => Promise<AppUpdateInfo>;
+      openReleasePage: (releaseUrl: string) => Promise<void>;
+      getPendingInvitation: () => Promise<string | undefined>;
+      onInvitation: (callback: (value: string) => void) => () => void;
       onNativeMediaEvent: (callback: (event: NativeMediaEvent) => void) => () => void;
     };
   }

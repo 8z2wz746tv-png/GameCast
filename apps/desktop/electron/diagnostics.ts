@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { deflateRawSync } from "node:zlib";
 import { AsyncLineWriter } from "./async-line-writer.js";
 
 export type DiagnosticLevel = "debug" | "info" | "warn" | "error";
@@ -61,41 +60,29 @@ export class DiagnosticsService {
   async exportBundle(): Promise<string> {
     await this.writer.flush();
     mkdirSync(this.desktopPath, { recursive: true });
-    const entries: Array<{ name: string; data: Buffer }> = [];
+    const logFiles: Buffer[] = [];
     for (let index = MAX_LOG_FILES - 1; index >= 1; index -= 1) {
       const rotatedPath = `${this.logPath}.${index}`;
       if (existsSync(rotatedPath)) {
-        entries.push({
-          name: `logs/gamecast.log.${index}`,
-          data: readFileSync(rotatedPath),
-        });
+        logFiles.push(readFileSync(rotatedPath));
       }
     }
     if (existsSync(this.logPath)) {
-      entries.push({ name: "logs/gamecast.log", data: readFileSync(this.logPath) });
+      logFiles.push(readFileSync(this.logPath));
     }
     const nativeMediaPath = join(this.userDataPath, "native-media.log");
-    if (existsSync(nativeMediaPath)) {
-      entries.push({ name: "logs/native-media.log", data: readFileSync(nativeMediaPath) });
-    }
-    entries.push({
-      name: "diagnostics.json",
-      data: Buffer.from(
-        JSON.stringify(
-          {
-            exportedAt: new Date().toISOString(),
-            metadata: sanitizeDiagnosticValue(this.metadata),
-          },
-          null,
-          2,
-        ),
-        "utf8",
-      ),
-    });
+    const legacyNativeLog = existsSync(nativeMediaPath)
+      ? readFileSync(nativeMediaPath)
+      : undefined;
 
     const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "");
-    const outputPath = join(this.desktopPath, `GameCast-diagnostics-${timestamp}.zip`);
-    writeFileSync(outputPath, createZip(entries));
+    const outputPath = join(this.desktopPath, `GameCast-diagnostics-${timestamp}.jsonl`);
+    writeFileSync(outputPath, createDiagnosticExport({
+      exportedAt: new Date().toISOString(),
+      metadata: this.metadata,
+      logFiles,
+      legacyNativeLog,
+    }));
     return outputPath;
   }
 
@@ -151,82 +138,48 @@ function sanitizeString(value: string): string {
     .slice(0, MAX_STRING_LENGTH);
 }
 
-export function createZip(entries: Array<{ name: string; data: Buffer }>): Buffer {
-  const localParts: Buffer[] = [];
-  const centralParts: Buffer[] = [];
-  let offset = 0;
-  const { time, date } = toDosDateTime(new Date());
-
-  for (const entry of entries) {
-    const name = Buffer.from(entry.name.replace(/\\/g, "/"), "utf8");
-    const compressed = deflateRawSync(entry.data, { level: 6 });
-    const checksum = crc32(entry.data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x0800, 6);
-    local.writeUInt16LE(8, 8);
-    local.writeUInt16LE(time, 10);
-    local.writeUInt16LE(date, 12);
-    local.writeUInt32LE(checksum, 14);
-    local.writeUInt32LE(compressed.length, 18);
-    local.writeUInt32LE(entry.data.length, 22);
-    local.writeUInt16LE(name.length, 26);
-    local.writeUInt16LE(0, 28);
-    localParts.push(local, name, compressed);
-
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4);
-    central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(0x0800, 8);
-    central.writeUInt16LE(8, 10);
-    central.writeUInt16LE(time, 12);
-    central.writeUInt16LE(date, 14);
-    central.writeUInt32LE(checksum, 16);
-    central.writeUInt32LE(compressed.length, 20);
-    central.writeUInt32LE(entry.data.length, 24);
-    central.writeUInt16LE(name.length, 28);
-    central.writeUInt16LE(0, 30);
-    central.writeUInt16LE(0, 32);
-    central.writeUInt16LE(0, 34);
-    central.writeUInt16LE(0, 36);
-    central.writeUInt32LE(0, 38);
-    central.writeUInt32LE(offset, 42);
-    centralParts.push(central, name);
-    offset += local.length + name.length + compressed.length;
-  }
-
-  const centralDirectory = Buffer.concat(centralParts);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(0, 4);
-  end.writeUInt16LE(0, 6);
-  end.writeUInt16LE(entries.length, 8);
-  end.writeUInt16LE(entries.length, 10);
-  end.writeUInt32LE(centralDirectory.length, 12);
-  end.writeUInt32LE(offset, 16);
-  end.writeUInt16LE(0, 20);
-  return Buffer.concat([...localParts, centralDirectory, end]);
-}
-
-function crc32(buffer: Buffer): number {
-  let crc = 0xffffffff;
-  for (const byte of buffer) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+export function createDiagnosticExport(input: {
+  exportedAt: string;
+  metadata: DiagnosticMetadata;
+  logFiles: Buffer[];
+  legacyNativeLog?: Buffer;
+}): Buffer {
+  const header = Buffer.from(`${JSON.stringify({
+    timestamp: input.exportedAt,
+    level: "info",
+    scope: "diagnostics",
+    event: "export.metadata",
+    data: {
+      schemaVersion: 1,
+      exportedAt: input.exportedAt,
+      metadata: sanitizeDiagnosticValue(input.metadata),
+    },
+  })}\n`, "utf8");
+  const parts = [header];
+  for (const logFile of input.logFiles) appendLineBuffer(parts, logFile);
+  if (input.legacyNativeLog) {
+    for (const line of input.legacyNativeLog.toString("utf8").split(/\r?\n/)) {
+      if (!line) continue;
+      const match = /^(\S+)\s+(.*)$/.exec(line);
+      const timestamp = match?.[1] && !Number.isNaN(Date.parse(match[1]))
+        ? match[1]
+        : input.exportedAt;
+      parts.push(Buffer.from(`${JSON.stringify({
+        timestamp,
+        level: "info",
+        scope: "native-media-legacy",
+        event: "message",
+        data: { message: sanitizeString(match?.[2] ?? line) },
+      })}\n`, "utf8"));
     }
   }
-  return (crc ^ 0xffffffff) >>> 0;
+  return Buffer.concat(parts);
 }
 
-function toDosDateTime(value: Date): { time: number; date: number } {
-  const year = Math.max(1980, value.getFullYear());
-  return {
-    time: (value.getHours() << 11) | (value.getMinutes() << 5) | Math.floor(value.getSeconds() / 2),
-    date: ((year - 1980) << 9) | ((value.getMonth() + 1) << 5) | value.getDate(),
-  };
+function appendLineBuffer(target: Buffer[], source: Buffer): void {
+  if (source.length === 0) return;
+  target.push(source);
+  if (source[source.length - 1] !== 0x0a) target.push(Buffer.from("\n"));
 }
 
 export function diagnosticFileName(path: string): string {

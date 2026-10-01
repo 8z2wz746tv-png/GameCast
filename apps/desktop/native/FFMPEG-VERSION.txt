@@ -1,0 +1,7 @@
+GameCast FFmpeg runtime
+Build: BtbN FFmpeg N-126313-g1ae4048218 (2026-08-29)
+Variant: Windows x64 GPL shared build
+Capture: gfxcapture (Windows Graphics Capture), ddagrab fallback
+SHA-256 (archive): 7899f5e4a7a2c05915f535b2b9bd94c206b001ea8e3e6d9ce2010ac8e81a0f8e
+
+This build is distributed under the FFmpeg project licenses. See ffmpeg.exe.LICENSE.

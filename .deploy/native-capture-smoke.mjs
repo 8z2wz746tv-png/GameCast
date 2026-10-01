@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { app, desktopCapturer } from "electron";
+import { RTCPeerConnection, useH264 } from "werift";
 import { NativeMediaService } from "../apps/desktop/dist-electron/native-media.js";
 
 const outputIndex = Number(process.env.GAMECAST_CAPTURE_OUTPUT ?? 0);
@@ -16,11 +17,15 @@ const preset = {
 };
 const publisherEvents = [];
 const errors = [];
+let receiver;
 const resultPath = join(tmpdir(), "gamecast-native-capture-smoke.json");
 const writeResult = (result) => writeFileSync(resultPath, JSON.stringify(result, null, 2), "utf8");
 const service = new NativeMediaService((event) => {
   if (event.type === "publisher-stats") publisherEvents.push(event);
   if (event.type === "error") errors.push(event.message);
+  if (event.type === "ice" && event.connectionId === "smoke-viewer") {
+    void receiver?.addIceCandidate(event.candidate ?? null);
+  }
 });
 const safetyTimer = setTimeout(() => {
   writeResult({ status: "failed", stage: "timeout", message: "native smoke test exceeded 60 seconds" });
@@ -73,7 +78,30 @@ try {
     iceServers: [],
     allowedHostAddresses: [],
   });
-  writeResult({ status: "running", stage: "sampling", encoder: started.encoder });
+  receiver = new RTCPeerConnection({
+    codecs: {
+      video: [useH264({
+        payloadType: 102,
+        parameters: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e033",
+      })],
+      audio: [],
+    },
+  });
+  receiver.onIceCandidate.subscribe((candidate) => {
+    void service.addIceCandidate("smoke-viewer", candidate?.toJSON() ?? null);
+  });
+  const offer = await service.createOffer("smoke-viewer");
+  await receiver.setRemoteDescription(offer);
+  const answer = await receiver.createAnswer();
+  await receiver.setLocalDescription(answer);
+  await service.setAnswer("smoke-viewer", receiver.localDescription);
+  writeResult({
+    status: "running",
+    stage: "sampling",
+    encoder: started.encoder,
+    captureBackend: started.captureBackend,
+    pipeline: started.pipeline,
+  });
   await delay(durationSeconds * 1_000);
 
   const frameSamples = publisherEvents
@@ -92,6 +120,8 @@ try {
     outputIndex: nativeOutputIndex,
     calibration,
     encoder: started.encoder,
+    captureBackend: started.captureBackend,
+    pipeline: started.pipeline,
     target: `${started.width}x${started.height}@${started.frameRate}`,
     bitrateKbps: started.bitrateKbps,
     actualFps,
@@ -109,6 +139,7 @@ try {
   failed = true;
 } finally {
   clearTimeout(safetyTimer);
+  await receiver?.close().catch(() => undefined);
   await service.stop().catch(() => undefined);
   if (failed) app.exit(1);
   else app.quit();

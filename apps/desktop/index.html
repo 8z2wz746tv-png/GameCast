@@ -9,7 +9,7 @@
     <script>
       try {
         const savedTheme = localStorage.getItem("gamecast.theme");
-        if (["oasis", "aurora", "amber", "rose"].includes(savedTheme)) {
+        if (["oasis", "aurora", "amber", "rose", "light"].includes(savedTheme)) {
           document.documentElement.dataset.theme = savedTheme;
         }
       } catch {}
@@ -31,6 +31,9 @@
       :root[data-theme="aurora"] #startup-screen { --startup-accent: #55c7ff; }
       :root[data-theme="amber"] #startup-screen { --startup-accent: #f4c55c; }
       :root[data-theme="rose"] #startup-screen { --startup-accent: #ff7997; }
+      :root[data-theme="light"] #startup-screen { --startup-accent: #137a54; background: #f3f7f5; }
+      :root[data-theme="light"] .startup-name { color: #17231e; }
+      :root[data-theme="light"] .startup-status { color: #617069; }
       #startup-screen.hiding { opacity: 0; pointer-events: none; }
       .startup-content { display: grid; justify-items: center; gap: 14px; }
       .startup-rose { width: 104px; height: 104px; overflow: visible; }
