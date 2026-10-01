@@ -2,9 +2,17 @@ import type { ClientSignalMessage } from "@gamecast/contracts";
 import type { RawData } from "ws";
 import { z } from "zod";
 
+/**
+ * The signaling socket caps a whole frame at 64 KiB (`maxPayload` in app.ts). The previous 256 000
+ * allowance could never be reached — an oversized SDP was killed by the socket instead of being
+ * rejected by this schema. 32 KiB leaves ample room for the JSON envelope, and a real screen-share
+ * SDP is a few kilobytes.
+ */
+const MAX_SDP_CHARS = 32_768;
+
 const descriptionSchema = z.object({
   type: z.enum(["offer", "answer"]),
-  sdp: z.string().max(256_000),
+  sdp: z.string().max(MAX_SDP_CHARS),
 });
 
 const candidateSchema = z.object({
@@ -14,6 +22,11 @@ const candidateSchema = z.object({
   usernameFragment: z.string().nullable().optional(),
 }).nullable();
 
+/**
+ * `satisfies` makes the shared contract the authority: if a message shape here and
+ * `ClientSignalMessage` in @gamecast/contracts ever diverge, the build fails instead of the two
+ * silently describing different protocols.
+ */
 const signalSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("auth"), sessionToken: z.string().min(20).max(256) }),
   z.object({ type: z.literal("heartbeat"), sentAt: z.number() }),
@@ -62,8 +75,8 @@ const signalSchema = z.discriminatedUnion("type", [
     connectionId: z.string().uuid(),
     targetParticipantId: z.string().uuid(),
   }),
-]);
+]) satisfies z.ZodType<ClientSignalMessage>;
 
 export function parseSignalMessage(raw: RawData): ClientSignalMessage {
-  return signalSchema.parse(JSON.parse(raw.toString()) as unknown) as ClientSignalMessage;
+  return signalSchema.parse(JSON.parse(raw.toString()) as unknown);
 }

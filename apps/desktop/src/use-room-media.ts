@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getApiBaseUrl } from "./api";
 import { diagnosticLog, errorDetails } from "./diagnostics";
 import { VIDEO_PRESETS } from "./media";
+import { type ActiveWatcher, updateActiveWatchers } from "./watch-notice";
 import {
   type MediaStats,
   type MediaConnectionStage,
@@ -60,6 +61,8 @@ export function useRoomMedia(session: RoomSession) {
   });
   const [captureMode, setCaptureMode] = useState<"browser" | "native" | null>(null);
   const [encoder, setEncoder] = useState<string | undefined>();
+  // Who is watching this participant's screen. Watching used to be entirely silent for the sharer.
+  const [watchers, setWatchers] = useState<ActiveWatcher[]>([]);
   const managerRef = useRef<P2PMediaManager | undefined>(undefined);
   const signalingRef = useRef<SignalingClient | undefined>(undefined);
   const displayedConnectionRef = useRef<string | undefined>(undefined);
@@ -107,6 +110,10 @@ export function useRoomMedia(session: RoomSession) {
 
     const initialize = async () => {
       const networks = await window.electronAPI?.listNetworkInterfaces().catch(() => []);
+      // The effect can be torn down while this IPC call is in flight — StrictMode does exactly that
+      // on every mount. Without this guard the continuation below would construct a manager and open
+      // a fresh authenticated signaling socket after cleanup ran, and nothing would ever close them.
+      if (disposed) return;
       const virtualNetworks = (networks ?? []).filter((network) => network.recommended);
       const allowedHostAddresses = session.p2p.candidatePolicy === "all"
         ? []
@@ -197,7 +204,14 @@ export function useRoomMedia(session: RoomSession) {
         });
       };
       try {
-        applySnapshot(await signaling.connect());
+        const snapshot = await signaling.connect();
+        // Disposal during the handshake: `connect()` clears manualClose and opens a new socket, so
+        // the earlier cleanup close would otherwise be undone here.
+        if (disposed) {
+          signaling.close();
+          return;
+        }
+        applySnapshot(snapshot);
       } catch (error) {
         if (disposed) return;
         diagnosticLog("room", "connect.failed", errorDetails(error), "error");
@@ -207,6 +221,8 @@ export function useRoomMedia(session: RoomSession) {
     };
 
     const updateRoomState = (message: ServerSignalMessage, mediaManager: P2PMediaManager) => {
+      // Independent of the media flow: the sharing banner must reflect the audience.
+      setWatchers((current) => updateActiveWatchers(current, message));
       switch (message.type) {
         case "auth.ok":
           applySnapshot(message.snapshot);
@@ -257,7 +273,11 @@ export function useRoomMedia(session: RoomSession) {
       signaling.close();
       signalingRef.current = undefined;
       managerRef.current = undefined;
-      void manager?.close();
+      // `close()` awaits the SFU disconnect, which can reject; an unhandled rejection here would
+      // escape teardown. Optional chaining short-circuits the whole chain when no manager was built.
+      void manager?.close().catch((error) => {
+        diagnosticLog("room", "manager.close.failed", errorDetails(error), "warn");
+      });
     };
   }, [applySnapshot, session]);
 
@@ -461,6 +481,7 @@ export function useRoomMedia(session: RoomSession) {
     updateSharePreset,
     stopSharing,
     isSharing,
+    watchers,
     localPreviewStream,
     hasSystemAudio,
     connectionState,

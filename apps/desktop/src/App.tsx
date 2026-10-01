@@ -43,6 +43,7 @@ import {
 import { getEffectiveQualityPolicy } from "./p2p/quality-policy";
 import { formatRoomInvitation, parseRoomInvitation } from "./room-invitation";
 import { isPrivateControlServerUrl } from "./server-address";
+import { describeWatchers } from "./watch-notice";
 import { useRoomMedia } from "./use-room-media";
 import type {
   CaptureSource,
@@ -932,7 +933,7 @@ function RoomView({ session, localHost, networkStarted, networkInvite, onLeave, 
 
       {live.mediaError && <div className="room-alert error"><WifiOff size={16} /><span>{live.mediaError}</span><button type="button" onClick={live.connectionStage.phase === "failed" ? live.retryMediaConnection : live.retryConnection}><RotateCw size={15} />{live.connectionStage.phase === "failed" ? "重试观看" : "重新连接"}</button></div>}
       {live.audioBlocked && <div className="room-alert audio"><Volume2 size={16} /><span>系统阻止了声音自动播放</span><button type="button" onClick={() => live.resumeAudio().catch(() => undefined)}>启用声音</button></div>}
-      {live.isSharing && <div className="room-alert privacy"><MonitorUp size={16} /><span><strong>正在共享屏幕内容</strong>{live.hasSystemAudio ? "，系统声音也会被朋友听到" : "，当前没有捕获系统声音"}</span><i className="privacy-pulse" /></div>}
+      {live.isSharing && <div className="room-alert privacy"><MonitorUp size={16} /><span><strong>正在共享屏幕内容</strong>{live.hasSystemAudio ? "，系统声音也会被朋友听到" : "，当前没有捕获系统声音"}；{describeWatchers(live.watchers)}</span><i className={`privacy-pulse${live.watchers.length > 0 ? " watched" : ""}`} /></div>}
 
       <div className="room-layout">
         <aside className="people-panel">

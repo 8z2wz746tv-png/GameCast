@@ -35,4 +35,29 @@ describe("Electron IPC validation", () => {
     assert.equal(parsed.networkName, "friends");
     assert.equal(parsed.networkSecret, "");
   });
+
+  it("accepts a relocated easytier-core.exe", () => {
+    const parsed = parseEasyTierStart({
+      networkName: "friends",
+      executablePath: "D:\\tools\\easytier\\easytier-core.exe",
+    });
+    assert.equal(parsed.executablePath, "D:\\tools\\easytier\\easytier-core.exe");
+  });
+
+  it("refuses to launch anything that is not easytier-core.exe", () => {
+    // `network:start` ends in `spawn(executablePath, ...)`, so this field must never name an
+    // arbitrary binary: doing so turns a renderer compromise into host code execution.
+    for (const executablePath of [
+      "C:\\Windows\\System32\\calc.exe",
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "D:\\tools\\easytier-core.exe.bak",
+      "/usr/bin/curl",
+    ]) {
+      assert.throws(
+        () => parseEasyTierStart({ networkName: "friends", executablePath }),
+        /easytier-core\.exe/,
+        `expected ${executablePath} to be rejected`,
+      );
+    }
+  });
 });

@@ -287,7 +287,8 @@ input::placeholder { color: var(--placeholder); }
 .room-alert.audio { color: var(--yellow); border-color: var(--warning-border); background: var(--warning-soft); }
 .room-alert.privacy { color: var(--text-soft); border-color: var(--primary-border); background: var(--primary-soft); }
 .room-alert.privacy > svg { color: var(--primary); }
-.privacy-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 4px rgb(255 145 135 / .12); animation: statusPulse .8s ease-in-out infinite alternate; }
+.privacy-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--muted-dim); }
+.privacy-pulse.watched { background: var(--danger); box-shadow: 0 0 0 4px rgb(255 145 135 / .12); animation: statusPulse .8s ease-in-out infinite alternate; }
 
 .room-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 14px; padding: 14px; }
 .people-panel { min-width: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }

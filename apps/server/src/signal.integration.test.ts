@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterEach, describe, it } from "node:test";
 import type {
   ClientSignalMessage,
@@ -335,7 +337,96 @@ describe("P2P signaling integration", () => {
     assert.equal(rejected.status, 429);
     assert.ok(rejected.headers.get("retry-after"));
   });
+
+  it("applies the room-write budget when the create URL carries a query string", async () => {
+    handle = await startControlServer({
+      host: "127.0.0.1",
+      port: 0,
+      clientOrigins: ["*"],
+      logger: false,
+      reconnectGraceSeconds: 1,
+      connectionTimeoutSeconds: 2,
+    });
+    // `request.url` includes the query string, so matching it exactly used to let these requests
+    // fall back to the looser general budget instead of the room-write one.
+    const create = () =>
+      fetch(`${handle?.url}/api/rooms?probe=1`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Query",
+          displayName: "Host",
+          mediaMode: "hybrid",
+          limits: { maxParticipants: 8, maxSharers: 4, maxViewersPerShare: 3 },
+        }),
+      });
+    for (let index = 0; index < 20; index += 1) {
+      assert.equal((await create()).status, 201);
+    }
+    assert.equal((await create()).status, 429);
+  });
+
+  it("revokes SFU access when a participant leaves the room", async () => {
+    const revoked: string[] = [];
+    const stub = await startStubLiveKit(revoked);
+    try {
+      handle = await startControlServer({
+        host: "127.0.0.1",
+        port: 0,
+        clientOrigins: ["*"],
+        logger: false,
+        reconnectGraceSeconds: 1,
+        connectionTimeoutSeconds: 2,
+        livekit: {
+          apiKey: "test-key",
+          apiSecret: "test-secret-with-at-least-16-chars",
+          serverUrl: stub.url,
+          serviceUrl: stub.url,
+        },
+      });
+      const session = await createRoom(handle.url);
+
+      const response = await fetch(`${handle.url}/api/session`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${session.sessionToken}` },
+      });
+      assert.equal(response.status, 204);
+
+      // Revocation is fire-and-forget so it can never block the leave path.
+      for (let attempt = 0; attempt < 20 && revoked.length === 0; attempt += 1) {
+        await delay(50);
+      }
+      assert.ok(revoked.length > 0, "leaving must remove the participant from the SFU room");
+      assert.match(
+        revoked.join(" "),
+        new RegExp(session.participant.id),
+        "the revoked identity must be the participant that left",
+      );
+    } finally {
+      await stub.close();
+    }
+  });
 });
+
+/** Minimal LiveKit control-plane stub: records RemoveParticipant calls, answers everything else. */
+async function startStubLiveKit(revoked: string[]): Promise<{ url: string; close(): Promise<void> }> {
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (request.url?.includes("RemoveParticipant")) revoked.push(body);
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
 
 async function createRoom(baseUrl: string): Promise<RoomSession> {
   const response = await fetch(`${baseUrl}/api/rooms`, {

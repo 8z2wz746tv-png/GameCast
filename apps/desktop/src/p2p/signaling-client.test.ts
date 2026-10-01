@@ -90,6 +90,28 @@ describe("SignalingClient reconnection", () => {
     assert.equal(FakeWebSocket.instances.length, 2);
     client.close();
   });
+
+  it("settles a connect() that is still pending when the client closes", async () => {
+    Object.defineProperty(globalThis, "window", { value: {}, configurable: true });
+    Object.defineProperty(globalThis, "WebSocket", {
+      value: FakeWebSocket,
+      configurable: true,
+    });
+    const client = new SignalingClient("ws://127.0.0.1/signal", "token", 30);
+    const connected = client.connect();
+    // The handshake never completes; the viewer leaves the room instead.
+    client.close();
+
+    // Raced against a deadline so a regression fails fast instead of hanging the runner.
+    const outcome = await Promise.race([
+      connected.then(
+        () => "resolved",
+        (error: Error) => error.message,
+      ),
+      delay(500).then(() => "timed-out"),
+    ]);
+    assert.equal(outcome, "信令连接已关闭");
+  });
 });
 
 function snapshot(): RoomSnapshot {

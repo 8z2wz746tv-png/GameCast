@@ -2,7 +2,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createSocket, type Socket } from "node:dgram";
 import { existsSync, readdirSync } from "node:fs";
 import { constants as osConstants, setPriority } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type {
   IceCandidateData,
   IceServerConfig,
@@ -1028,6 +1028,16 @@ function captureNativeOutputPreview(
   });
 }
 
+/**
+ * `GAMECAST_FFMPEG_PATH` lets a deployer point at a different, verified FFmpeg build (see
+ * docs/deployment.md), but it must still name an ffmpeg binary — otherwise the override becomes a
+ * way to run an arbitrary executable. Backslashes are normalised so Windows paths classify
+ * correctly on any platform.
+ */
+function isFfmpegExecutablePath(value: string): boolean {
+  return basename(value.replace(/\\/g, "/")).toLowerCase() === "ffmpeg.exe";
+}
+
 function resolveFfmpegPath(): string | undefined {
   const candidates = [
     process.env.GAMECAST_FFMPEG_PATH,
@@ -1038,7 +1048,10 @@ function resolveFfmpegPath(): string | undefined {
     getStaticFfmpegPath(),
     findJianyingFfmpeg(),
   ];
-  return candidates.find((candidate): candidate is string => Boolean(candidate && existsSync(candidate)));
+  return candidates.find(
+    (candidate): candidate is string =>
+      Boolean(candidate && isFfmpegExecutablePath(candidate) && existsSync(candidate)),
+  );
 }
 
 function getStaticFfmpegPath(): string | undefined {

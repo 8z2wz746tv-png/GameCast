@@ -2,6 +2,7 @@
   "name": "@gamecast/server",
   "version": "0.1.0",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -18,7 +19,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "tsx --test src/services/room-service.test.ts src/services/request-rate-limiter.test.ts src/services/media-routing-policy.test.ts src/signal.integration.test.ts",
+    "test": "tsx --test src/config.test.ts src/services/room-service.test.ts src/services/request-rate-limiter.test.ts src/services/media-routing-policy.test.ts src/signal.integration.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

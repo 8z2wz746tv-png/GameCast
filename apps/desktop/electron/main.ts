@@ -31,6 +31,7 @@ import {
   type DiagnosticLogEntry,
   DiagnosticsService,
 } from "./diagnostics.js";
+import { resolveDevServerUrl } from "./dev-server-url.js";
 import {
   type HostSettingsInput,
   parseBitrate,
@@ -735,7 +736,14 @@ async function createWindow(): Promise<void> {
       sandbox: true,
     },
   });
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  const configuredDevServerUrl = process.env.VITE_DEV_SERVER_URL?.trim();
+  const devServerUrl = resolveDevServerUrl(configuredDevServerUrl, app.isPackaged);
+  if (configuredDevServerUrl && !devServerUrl) {
+    console.warn(
+      `[gamecast] ignoring VITE_DEV_SERVER_URL (${configuredDevServerUrl}): ` +
+        "only loopback http is allowed, and never in a packaged build",
+    );
+  }
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {
     const currentUrl = window.webContents.getURL();

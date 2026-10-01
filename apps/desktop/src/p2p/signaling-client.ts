@@ -85,6 +85,16 @@ export class SignalingClient {
     this.reconnectTimer = undefined;
     this.socket?.close(1000, "Client leaving");
     this.socket = undefined;
+    // A caller still awaiting `connect()` would otherwise never settle — which is exactly what
+    // happens when a room is left mid-handshake, and it retains the whole media manager closure.
+    this.rejectPendingConnect("信令连接已关闭");
+  }
+
+  private rejectPendingConnect(message: string): void {
+    const reject = this.initialReject;
+    this.initialResolve = undefined;
+    this.initialReject = undefined;
+    reject?.(new Error(message));
   }
 
   private open(isReconnect: boolean): void {
@@ -164,9 +174,7 @@ export class SignalingClient {
     if (Date.now() >= this.reconnectDeadline) {
       diagnosticLog("signaling", "reconnect.expired", undefined, "error");
       this.reconnectCycleActive = false;
-      this.initialReject?.(new Error("无法连接房主信令服务"));
-      this.initialResolve = undefined;
-      this.initialReject = undefined;
+      this.rejectPendingConnect("无法连接房主信令服务");
       this.onStateChange?.("disconnected");
       return;
     }

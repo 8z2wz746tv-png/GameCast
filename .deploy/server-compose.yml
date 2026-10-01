@@ -5,6 +5,10 @@ services:
       dockerfile: infra/server-runtime.Dockerfile
     container_name: gamecast-control
     env_file: .env
+    environment:
+      # The reverse proxy sits on a Docker bridge network (172.16.0.0/12). Without this the rate
+      # limiter keys every client to the proxy address and they all share one bucket.
+      TRUST_PROXY: "${TRUST_PROXY:-172.16.0.0/12}"
     depends_on:
       - livekit
       - coturn
@@ -56,6 +60,10 @@ services:
       - --pkey=/etc/coturn-certs/privkey.pem
       - --min-port=49160
       - --max-port=49200
+      # Bound how much of the relay pool a single credential can hold, so one leaked or brute-forced
+      # TURN credential cannot starve every other session.
+      - --user-quota=8
+      - --total-quota=200
       - --log-file=stdout
     volumes:
       - ./coturn-certs:/etc/coturn-certs:ro

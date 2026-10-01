@@ -36,18 +36,20 @@ const limitsSchema = z
     }
   });
 
+// `satisfies` ties these schemas to the shared contract, so a field that drifts out of
+// `CreateRoomRequest` / `JoinRoomRequest` fails the build instead of quietly changing the API.
 const createRoomSchema = z.object({
   title: z.string().trim().min(1).max(64),
   displayName: z.string().trim().min(1).max(32),
   password: z.string().max(128).optional(),
   mediaMode: z.literal("hybrid"),
   limits: limitsSchema,
-});
+}) satisfies z.ZodType<CreateRoomRequest>;
 
 const joinRoomSchema = z.object({
   displayName: z.string().trim().min(1).max(32),
   password: z.string().max(128).optional(),
-});
+}) satisfies z.ZodType<JoinRoomRequest>;
 
 const roomCodeSchema = z.string().trim().length(6).toUpperCase();
 
@@ -64,7 +66,7 @@ export async function registerRoomRoutes(
   reconnectGraceSeconds: number,
 ): Promise<void> {
   app.post("/api/rooms", async (request, reply) => {
-    const input = createRoomSchema.parse(request.body) as CreateRoomRequest;
+    const input = createRoomSchema.parse(request.body);
     const access = await rooms.create(input, await mediaSessions.isSfuAvailable());
     events.onSessionCreated(access);
     return reply
@@ -79,7 +81,7 @@ export async function registerRoomRoutes(
 
   app.post("/api/rooms/:code/join", async (request) => {
     const params = z.object({ code: roomCodeSchema }).parse(request.params);
-    const input = joinRoomSchema.parse(request.body) as JoinRoomRequest;
+    const input = joinRoomSchema.parse(request.body);
     const access = await rooms.join(params.code, input);
     events.onSessionCreated(access);
     return createResponse(access, rooms, mediaSessions, reconnectGraceSeconds);

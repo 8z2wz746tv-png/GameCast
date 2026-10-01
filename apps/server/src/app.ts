@@ -8,7 +8,7 @@ import { ZodError } from "zod";
 import type { ControlServerRuntimeConfig } from "./config.js";
 import { DomainError } from "./domain/errors.js";
 import { registerRoomRoutes } from "./routes/rooms.js";
-import { MediaSessionService } from "./services/media-token-service.js";
+import { MediaSessionService, PREFLIGHT_ICE_TTL_SECONDS } from "./services/media-token-service.js";
 import { RequestRateLimiter } from "./services/request-rate-limiter.js";
 import { RoomService } from "./services/room-service.js";
 import { SignalHub } from "./services/signal-hub.js";
@@ -24,7 +24,10 @@ export type ControlServerHandle = {
 export async function createControlServer(
   config: ControlServerRuntimeConfig,
 ): Promise<FastifyInstance> {
-  const app = Fastify({ logger: config.logger });
+  // `trustProxy` stays undefined unless TRUST_PROXY names the reverse proxy explicitly. Rate limits
+  // key on `request.ip`; behind an unlisted proxy that is the proxy itself, which would collapse
+  // every client into a single shared bucket.
+  const app = Fastify({ logger: config.logger, trustProxy: config.trustProxy });
   const deploymentMode = config.deploymentMode ?? "embedded";
   const sfuViewerThreshold = config.sfuViewerThreshold ?? 2;
   const rooms = new RoomService(undefined, sfuViewerThreshold);
@@ -39,10 +42,12 @@ export async function createControlServer(
     rooms,
     config.reconnectGraceSeconds,
     config.heartbeatTimeoutMs,
+    (roomId, participantId) => mediaSessions.revokeSfuAccess(roomId, participantId),
   );
   const socketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   const requestLimiter = new RequestRateLimiter();
   const upgradeLimiter = new RequestRateLimiter();
+  const preflightLimiter = new RequestRateLimiter();
 
   await app.register(cors, {
     origin: config.clientOrigins,
@@ -51,9 +56,12 @@ export async function createControlServer(
 
   app.addHook("onRequest", async (request, reply) => {
     if (!request.url.startsWith("/api/")) return;
+    // Match on the path alone: `request.url` includes the query string, so the previous exact
+    // comparison let `POST /api/rooms?x=1` skip the stricter room-write budget entirely.
+    const path = request.url.split("?")[0] ?? request.url;
     const general = requestLimiter.consume(`api:${request.ip}`, 120, 60_000);
-    const isCreate = request.method === "POST" && request.url === "/api/rooms";
-    const isJoin = request.method === "POST" && /^\/api\/rooms\/[^/]+\/join(?:\?|$)/.test(request.url);
+    const isCreate = request.method === "POST" && path === "/api/rooms";
+    const isJoin = request.method === "POST" && /^\/api\/rooms\/[^/]+\/join$/.test(path);
     const sensitive = isCreate || isJoin
       ? requestLimiter.consume(`room-write:${request.ip}`, 20, 60_000)
       : { allowed: true, retryAfterSeconds: 0 };
@@ -94,11 +102,24 @@ export async function createControlServer(
     sfuAvailable: await mediaSessions.isSfuAvailable(),
     sfuViewerThreshold,
   }));
-  app.get("/api/network/preflight", async () => ({
-    p2p: mediaSessions.createP2PSession(`preflight-${randomUUID()}`),
-    sfuAvailable: await mediaSessions.isSfuAvailable(),
-    issuedAt: new Date().toISOString(),
-  }));
+  app.get("/api/network/preflight", async (request, reply) => {
+    // Unauthenticated by design: the client runs this before it has a room session. It therefore
+    // gets its own budget and only short-lived ICE credentials, so it cannot be used to stockpile
+    // TURN relays or to exhaust the budget shared by room operations.
+    const rate = preflightLimiter.consume(`preflight:${request.ip}`, 10, 60_000);
+    if (!rate.allowed) {
+      reply.header("Retry-After", String(rate.retryAfterSeconds));
+      throw new DomainError("RATE_LIMITED", "网络检测过于频繁，请稍后再试", 429);
+    }
+    return {
+      p2p: mediaSessions.createP2PSession(
+        `preflight-${randomUUID()}`,
+        PREFLIGHT_ICE_TTL_SECONDS,
+      ),
+      sfuAvailable: await mediaSessions.isSfuAvailable(),
+      issuedAt: new Date().toISOString(),
+    };
+  });
   app.post("/api/network/upload-probe", async (request) => {
     const body = request.body as { payload?: unknown } | undefined;
     if (typeof body?.payload !== "string" || body.payload.length > 768 * 1024) {

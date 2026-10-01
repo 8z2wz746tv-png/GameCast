@@ -12,6 +12,12 @@ import type {
 import type { Participant, Room } from "../domain/room.js";
 
 const TOKEN_TTL_SECONDS = 6 * 60 * 60;
+/**
+ * ICE credentials handed out by the unauthenticated `/api/network/preflight` probe. The probe only
+ * needs to complete one gathering round (the client gives up after 6s), so a short lifetime keeps
+ * that endpoint from being used to stockpile long-lived TURN relays.
+ */
+export const PREFLIGHT_ICE_TTL_SECONDS = 10 * 60;
 const AVAILABILITY_CACHE_MS = 30_000;
 
 export class MediaSessionService {
@@ -26,9 +32,9 @@ export class MediaSessionService {
     private readonly candidatePolicy: P2PSession["candidatePolicy"] = "selected",
   ) {}
 
-  createP2PSession(participantId: string): P2PSession {
+  createP2PSession(participantId: string, ttlSeconds: number = TOKEN_TTL_SECONDS): P2PSession {
     return {
-      iceServers: this.createIceServers(participantId),
+      iceServers: this.createIceServers(participantId, ttlSeconds),
       connectionTimeoutSeconds: this.connectionTimeoutSeconds,
       candidatePolicy: this.candidatePolicy,
     };
@@ -51,14 +57,8 @@ export class MediaSessionService {
       return this.lastAvailabilityResult;
     }
     this.lastAvailabilityCheck = Date.now();
-    const serviceUrl = (this.livekit.serviceUrl ?? this.livekit.serverUrl)
-      .replace(/^ws:/, "http:")
-      .replace(/^wss:/, "https:");
-    const client = new RoomServiceClient(
-      serviceUrl,
-      this.livekit.apiKey,
-      this.livekit.apiSecret,
-    );
+    const client = this.roomServiceClient();
+    if (!client) return false;
     try {
       await Promise.race([
         client.listRooms(),
@@ -71,6 +71,37 @@ export class MediaSessionService {
       this.lastAvailabilityResult = false;
     }
     return this.lastAvailabilityResult;
+  }
+
+  private roomServiceClient(): RoomServiceClient | undefined {
+    if (!this.livekit) return undefined;
+    const serviceUrl = (this.livekit.serviceUrl ?? this.livekit.serverUrl)
+      .replace(/^ws:/, "http:")
+      .replace(/^wss:/, "https:");
+    return new RoomServiceClient(serviceUrl, this.livekit.apiKey, this.livekit.apiSecret);
+  }
+
+  /**
+   * A LiveKit token stays valid for its entire TTL, so a participant who leaves the room would keep
+   * publish and subscribe access to the SFU room until it expires. Removing them from the SFU is what
+   * actually ends that access.
+   *
+   * Best effort on purpose: the participant may never have joined the SFU, and a revocation failure
+   * must not break the leave path.
+   */
+  async revokeSfuAccess(roomId: string, participantId: string): Promise<void> {
+    const client = this.roomServiceClient();
+    if (!client) return;
+    try {
+      await Promise.race([
+        client.removeParticipant(roomId, participantId),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("LiveKit revoke timeout")), 2_000),
+        ),
+      ]);
+    } catch {
+      // The token still expires on its own; revocation is an additional guarantee, not the only one.
+    }
   }
 
   async issueSfuSession(
@@ -94,7 +125,7 @@ export class MediaSessionService {
     return { serverUrl: this.livekit.serverUrl, token: await token.toJwt() };
   }
 
-  private createIceServers(participantId: string): IceServerConfig[] {
+  private createIceServers(participantId: string, ttlSeconds: number): IceServerConfig[] {
     const turn = this.turn;
     const stunUrls = [...new Set([
       ...this.stunUrls,
@@ -108,7 +139,7 @@ export class MediaSessionService {
     if (turnUrls.length === 0) return servers;
 
     if (turn?.sharedSecret) {
-      const expiresAt = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
+      const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
       const username = `${expiresAt}:${participantId}`;
       const credential = createHmac("sha1", turn.sharedSecret)
         .update(username)

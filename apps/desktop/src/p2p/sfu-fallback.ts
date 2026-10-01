@@ -134,6 +134,11 @@ export class SfuFallback {
       if (!this.subscription.resolved) {
         this.subscription.reject(new Error("已切换到其他共享者"));
       }
+      // The stream handed to the caller otherwise keeps live remote tracks after we stop watching.
+      for (const track of this.subscription.stream.getTracks()) {
+        this.subscription.stream.removeTrack(track);
+        track.stop();
+      }
       this.subscription = undefined;
     }
     if (this.room && this.subscribedTarget) {

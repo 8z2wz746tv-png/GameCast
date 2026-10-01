@@ -2,6 +2,7 @@
   "name": "@gamecast/desktop",
   "version": "0.3.7",
   "private": true,
+  "license": "GPL-3.0-only",
   "type": "module",
   "description": "GameCast Windows desktop client",
   "author": "GameCast contributors",
@@ -12,7 +13,7 @@
     "clean:electron": "node -e \"require('node:fs').rmSync('dist-electron',{recursive:true,force:true})\"",
     "build:electron": "npm run clean:electron && tsc -p tsconfig.electron.json && esbuild electron/native-media.ts --bundle --platform=node --format=esm --target=node22 --external:electron --external:ffmpeg-static --sourcemap --banner:js=\"import { createRequire as __gamecastCreateRequire } from 'node:module'; const require = __gamecastCreateRequire(import.meta.url);\" --outfile=dist-electron/native-media.js",
     "package:win": "npm run build && electron-builder --win --x64",
-    "test": "tsx --test src/network-preflight.test.ts src/p2p/quality-policy.test.ts src/p2p/display-capture-error.test.ts src/p2p/inbound-stall-detector.test.ts src/p2p/ice-candidate-buffer.test.ts src/p2p/connection-recovery-policy.test.ts src/p2p/signaling-client.test.ts src/room-invitation.test.ts src/server-address.test.ts electron/async-line-writer.test.ts electron/diagnostics.test.ts electron/ipc-validation.test.ts electron/network-adapter.test.ts electron/native-output.test.ts electron/native-rtp-fanout.test.ts electron/native-rtp-webrtc.test.ts electron/native-video-pipeline.test.ts electron/rtp-continuity.test.ts electron/serial-task-queue.test.ts",
+    "test": "tsx --test src/network-preflight.test.ts src/p2p/quality-policy.test.ts src/p2p/display-capture-error.test.ts src/p2p/inbound-stall-detector.test.ts src/p2p/ice-candidate-buffer.test.ts src/p2p/connection-recovery-policy.test.ts src/p2p/p2p-media-manager.test.ts src/p2p/signaling-client.test.ts src/room-invitation.test.ts src/server-address.test.ts src/watch-notice.test.ts electron/async-line-writer.test.ts electron/diagnostics.test.ts electron/dev-server-url.test.ts electron/ipc-validation.test.ts electron/network-adapter.test.ts electron/native-output.test.ts electron/native-rtp-fanout.test.ts electron/native-rtp-webrtc.test.ts electron/native-video-pipeline.test.ts electron/rtp-continuity.test.ts electron/serial-task-queue.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit"
   },
   "dependencies": {

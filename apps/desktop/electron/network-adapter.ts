@@ -1,7 +1,7 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { networkInterfaces } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import type { Readable } from "node:stream";
 
 export type NetworkAdapterKind = "direct" | "easytier";
@@ -206,6 +206,20 @@ export function findEasyTierInterface(preferredAddress?: string): { name: string
   return interfaces[0];
 }
 
+export const EASY_TIER_EXECUTABLE_NAME = "easytier-core.exe";
+
+/**
+ * A configured EasyTier path is attacker-reachable: it arrives over `network:start` from the
+ * renderer and is also persisted to host-settings.json. It may therefore only ever name the
+ * EasyTier core binary — without this check `network:start` degrades into "spawn any file on disk",
+ * which turns a renderer compromise into arbitrary host code execution.
+ *
+ * Backslashes are normalised first so Windows paths are classified correctly on any platform.
+ */
+export function isEasyTierExecutablePath(value: string): boolean {
+  return basename(value.replace(/\\/g, "/")).toLowerCase() === EASY_TIER_EXECUTABLE_NAME;
+}
+
 export function resolveEasyTierExecutable(
   configuredPath: string | undefined,
   resourcesPath: string,
@@ -213,9 +227,11 @@ export function resolveEasyTierExecutable(
 ): string | undefined {
   const candidates = [
     configuredPath?.trim(),
-    join(resourcesPath, "native", "easytier-core.exe"),
-    join(appPath, "native", "easytier-core.exe"),
-  ].filter((value): value is string => Boolean(value));
+    join(resourcesPath, "native", EASY_TIER_EXECUTABLE_NAME),
+    join(appPath, "native", EASY_TIER_EXECUTABLE_NAME),
+  ].filter(
+    (value): value is string => typeof value === "string" && isEasyTierExecutablePath(value),
+  );
   return candidates.find((candidate) => existsSync(candidate));
 }
 

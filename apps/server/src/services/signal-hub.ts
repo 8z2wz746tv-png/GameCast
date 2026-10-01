@@ -32,6 +32,11 @@ export class SignalHub {
     private readonly rooms: RoomService,
     private readonly reconnectGraceSeconds: number,
     private readonly heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS,
+    /**
+     * Ends a participant's SFU access. Injected so the hub stays free of media-service IO: without it
+     * a participant who left keeps publish and subscribe rights until their LiveKit token expires.
+     */
+    private readonly revokeSfuAccess?: (roomId: string, participantId: string) => Promise<void>,
   ) {
     const healthIntervalMs = Math.min(5_000, Math.max(250, heartbeatTimeoutMs / 4));
     this.healthTimer = setInterval(() => this.checkHeartbeats(), healthIntervalMs);
@@ -113,6 +118,7 @@ export class SignalHub {
   onParticipantRemoved(removal: ParticipantRemoval): void {
     const roomId = removal.room.id;
     const removedKey = this.key(roomId, removal.participant.id);
+    this.revokeSfu(roomId, removal.participant.id);
     const removedConnection = this.connections.get(removedKey);
     this.connections.delete(removedKey);
     this.announcedParticipants.delete(removedKey);
@@ -127,6 +133,7 @@ export class SignalHub {
       });
       for (const [key, connection] of this.connections) {
         if (connection.access.room.id !== roomId) continue;
+        this.revokeSfu(roomId, connection.access.participant.id);
         this.connections.delete(key);
         this.announcedParticipants.delete(key);
         this.clearGraceTimer(key);
@@ -148,6 +155,11 @@ export class SignalHub {
       participantId: removal.participant.id,
       participantCount: removal.room.participants.size,
     });
+  }
+
+  /** Fire-and-forget: revocation must never block, or fail, the removal path. */
+  private revokeSfu(roomId: string, participantId: string): void {
+    void this.revokeSfuAccess?.(roomId, participantId).catch(() => undefined);
   }
 
   close(): void {

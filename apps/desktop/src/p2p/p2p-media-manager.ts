@@ -98,6 +98,8 @@ type IncomingConnection = {
   requestReason: "selection" | "media-stalled";
   keyFrameRequestedAt?: number;
   fallbackRequested?: boolean;
+  /** Detachers for the listeners attached to remote tracks; see `configureIncoming`. */
+  trackListenerCleanups?: Array<() => void>;
 };
 
 const MAX_INITIAL_P2P_ATTEMPTS = 2;
@@ -116,6 +118,12 @@ export class P2PMediaManager {
   private nativeAudioPeer: RTCPeerConnection | undefined;
   private auxiliaryCaptureReduced = false;
   private shareStartPromise: Promise<void> | undefined;
+  /**
+   * Bumped by `stopSharing`. `startSharingExclusive` crosses user-paced awaits (the source picker)
+   * and compares against this afterwards so a capture that finishes starting after a stop is
+   * abandoned instead of published.
+   */
+  private shareGeneration = 0;
   private captureEndedTrack: MediaStreamTrack | undefined;
   private captureEndedHandler: (() => void) | undefined;
   private disposeNativeEvents: (() => void) | undefined;
@@ -232,6 +240,8 @@ export class P2PMediaManager {
     });
     if (window.electronAPI) await window.electronAPI.selectCaptureSource(sourceId);
     await this.stopSharing(false);
+    // Read after the internal stop above, which bumps the counter.
+    const generation = this.shareGeneration;
     this.requestedPreset = preset;
     let stream: MediaStream;
     let audioCaptureError: unknown;
@@ -270,6 +280,10 @@ export class P2PMediaManager {
         diagnosticLog("media", "capture.video-only-retry-failed", errorDetails(retryError), "error");
         throw new Error(describeDisplayCaptureFailure(retryError, sourceKind, preset));
       }
+    }
+    if (generation !== this.shareGeneration) {
+      this.abandonCapture(stream, "stopped-while-choosing-a-source");
+      return;
     }
     const videoTrack = stream.getVideoTracks()[0];
     if (!videoTrack) {
@@ -319,6 +333,10 @@ export class P2PMediaManager {
       throw error;
     }
     const capturedSystemAudio = stream.getAudioTracks().length > 0;
+    if (generation !== this.shareGeneration) {
+      this.abandonCapture(stream, "stopped-during-capture-setup");
+      return;
+    }
     if (useNativeScreenCapture && window.electronAPI) {
       try {
         const audioOffer = capturedSystemAudio
@@ -494,6 +512,16 @@ export class P2PMediaManager {
       outgoingPeers: this.outgoing.size,
       nativeOutgoingPeers: this.nativeOutgoing.size,
     });
+    // Invalidate any capture still being set up: `getDisplayMedia` is user-paced, so its continuation
+    // can resume long after this returns.
+    this.shareGeneration += 1;
+    // The local preview mirrors the shared stream; clearing only `onLocalShareChanged` would leave
+    // the stage showing a frozen frame of a stopped capture.
+    const localPreviewId = `local-${this.selfParticipantId}`;
+    if (this.displayedConnectionId === localPreviewId) {
+      this.callbacks.onStreamCleared(localPreviewId);
+      this.displayedConnectionId = undefined;
+    }
     const stream = this.localStream;
     this.localStream = undefined;
     this.detachCaptureEndedHandler();
@@ -520,6 +548,22 @@ export class P2PMediaManager {
       } catch {
         // The room may already be closing.
       }
+    }
+  }
+
+  /**
+   * Tears down a capture that finished starting after `stopSharing()` had already run. Publishing it
+   * would keep a screen capture — and in native mode a hardware encoder — alive with no `share.start`
+   * ever sent, so the room could not see it and the UI could not stop it.
+   */
+  private abandonCapture(stream: MediaStream, reason: string): void {
+    diagnosticLog("media", "capture.abandoned", { reason }, "warn");
+    stream.getTracks().forEach((track) => {
+      track.stop();
+    });
+    if (this.localStream === stream) {
+      this.localStream = undefined;
+      this.detachCaptureEndedHandler();
     }
   }
 
@@ -887,6 +931,15 @@ export class P2PMediaManager {
         requestReason: "selection",
       };
       this.incoming.set(connectionId, record);
+      // An offer for a watch we never asked for still allocates a pc and, once a track arrives,
+      // starts the 250ms first-frame poll. Without a deadline that record leaks for the whole
+      // session, because nothing else tracks this connection id.
+      const unexpected = record;
+      record.timeout = setTimeout(() => {
+        if (this.incoming.get(connectionId) !== unexpected || unexpected.ready) return;
+        diagnosticLog("viewer", "offer.timeout", { connectionId, participantId }, "warn");
+        this.closeIncoming(connectionId);
+      }, this.p2pSession.connectionTimeoutSeconds * 1000);
     }
     this.configureIncoming(record);
     await record.pc.setRemoteDescription(description);
@@ -948,18 +1001,29 @@ export class P2PMediaManager {
         });
         this.waitForFirstDecodedFrame(record);
       };
-      event.track.addEventListener("mute", () => {
+      const onMute = () => {
         diagnosticLog("viewer", "video-track.muted", {
           connectionId: record.connectionId,
           readyState: event.track.readyState,
         }, "warn");
-      });
-      event.track.addEventListener("ended", () => {
+      };
+      const onEnded = () => {
         diagnosticLog("viewer", "video-track.ended", {
           connectionId: record.connectionId,
         }, "warn");
-      });
+      };
+      event.track.addEventListener("mute", onMute);
+      event.track.addEventListener("ended", onEnded);
       event.track.addEventListener("unmute", activate, { once: true });
+      // Remote tracks outlive the connection and are handed to React, so these listeners must be
+      // detached by hand when the record closes — otherwise they retain it (and the pc) for the
+      // rest of the session.
+      if (!record.trackListenerCleanups) record.trackListenerCleanups = [];
+      record.trackListenerCleanups.push(() => {
+        event.track.removeEventListener("mute", onMute);
+        event.track.removeEventListener("ended", onEnded);
+        event.track.removeEventListener("unmute", activate);
+      });
       if (!event.track.muted) setTimeout(activate, 0);
     };
   }
@@ -994,7 +1058,11 @@ export class P2PMediaManager {
         connectionId: record.connectionId,
         ...firstFrame,
       });
-      await this.activateIncoming(record);
+      // `check()` runs from a 250ms interval, so anything escaping it becomes an unhandled rejection;
+      // `detectTransport` reads `getStats()` on a pc that may have been closed in the meantime.
+      await this.activateIncoming(record).catch((error) => {
+        diagnosticLog("viewer", "stream.activation-failed", errorDetails(error), "warn");
+      });
     };
     record.readinessTimer = setInterval(() => void check(), 250);
     void check();
@@ -1007,6 +1075,19 @@ export class P2PMediaManager {
     record.readinessTimer = undefined;
     if (record.timeout) clearTimeout(record.timeout);
     record.transport = await this.detectTransport(record.pc);
+    // `detectTransport` awaits `getStats()`, and the viewer can switch shares or the watch can be
+    // released while it is in flight — that deletes the record and closes the pc. Re-validate before
+    // touching the UI or the server, otherwise a dead stream is displayed and never cleared.
+    const stillCurrent =
+      this.pendingConnectionId === record.connectionId ||
+      this.activeConnectionId === record.connectionId;
+    if (!this.incoming.has(record.connectionId) || !stillCurrent) {
+      diagnosticLog("viewer", "stream.activation-abandoned", {
+        connectionId: record.connectionId,
+        reason: "connection-released-during-transport-detection",
+      }, "warn");
+      return;
+    }
     diagnosticLog("viewer", "stream.activated", {
       connectionId: record.connectionId,
       targetParticipantId: record.targetParticipantId,
@@ -1756,6 +1837,8 @@ export class P2PMediaManager {
     if (record.disconnectTimer) clearTimeout(record.disconnectTimer);
     record.readinessTimer = undefined;
     record.disconnectTimer = undefined;
+    for (const detach of record.trackListenerCleanups ?? []) detach();
+    record.trackListenerCleanups = undefined;
     record.pc.close();
     this.incoming.delete(connectionId);
     this.pendingCandidates.delete(connectionId);
@@ -1765,6 +1848,12 @@ export class P2PMediaManager {
     }
     if (!preservePending && this.pendingConnectionId === connectionId) {
       this.pendingConnectionId = undefined;
+    }
+    // Guarded by equality: `handleCommitted` assigns the new id before closing the previous record,
+    // so clearing unconditionally here would drop the connection that just became active. Leaving it
+    // set is what makes `monitorActiveConnection` sample a missing record and skip the next watch.
+    if (this.activeConnectionId === connectionId) {
+      this.activeConnectionId = undefined;
     }
   }
 }

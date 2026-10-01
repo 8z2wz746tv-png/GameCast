@@ -14,6 +14,13 @@ GameCast 有两种部署模式：
 3. 设置以下关键变量：
 
    - `DEPLOYMENT_MODE=internet`
+   - `TRUST_PROXY`：反向代理的地址或网段（逗号分隔，如 `172.16.0.0/12`）。限流按客户端地址
+     分桶，服务在反向代理后面时**必须**填写，否则所有客户端会共用一个限流配额，任何一个客户端
+     打满都会影响其他人。直接对外暴露控制服务时留空；不要填写通配符，否则客户端可以伪造地址
+     绕过限流。
+   - `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`：必须替换为独立密钥。控制服务在检测到这两个值仍是
+     仓库内的示例值时会**拒绝启动**，避免在公网用公开密钥签发 LiveKit 令牌。本地开发可以设置
+     `ALLOW_INSECURE_DEFAULTS=true` 跳过该检查。
    - `STUN_URLS`：可访问的 STUN 地址，多个地址用逗号分隔。
    - `TURN_URLS`：必须是客户端可访问的公网 IP 或域名，不能填写 `localhost`、`127.0.0.1` 或容器名。UDP/TCP TURN 建议同时提供公网 IPv4 字面地址作为 DNS 故障回退；`turns:` 仍使用证书域名。
    - `TURN_SHARED_SECRET`：必须与 coturn 的 `static-auth-secret` 相同。

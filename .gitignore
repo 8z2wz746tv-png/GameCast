@@ -16,6 +16,10 @@ release/
 .tmp-*.mjs
 .tmp-*.cjs
 .pnpm-store/
+# Local tool caches that must never be committed (Electron downloads ~300 MB into node_modules,
+# and package caches are not project content).
+.npm-cache/
+.electron-cache/
 release-*/
 app-asar-*/
 electron-dist-*/
